@@ -29,11 +29,12 @@
       "kind": "select",
       "options": [
         "",
+        "none",
         "low",
         "medium",
         "high"
       ],
-      "help": "Only for thinking models (Gemini 3.x, o-series). Leave empty otherwise."
+      "help": "Only for thinking models (Gemini 3.x, o-series). Leave empty otherwise. \"none\" is for models that think by default and would otherwise ink their reasoning — Groq's qwen3.6 needs it."
     },
     {
       "key": "RIDDLE_OPENAI_MAX_TOKENS",
@@ -90,6 +91,22 @@
       "values": {
         "RIDDLE_OPENAI_BASE": "https://openrouter.ai/api/v1",
         "RIDDLE_OPENAI_MODEL": "openai/gpt-4o-mini",
+        "RIDDLE_OPENAI_REASONING": ""
+      }
+    },
+    {
+      "name": "Groq",
+      "values": {
+        "RIDDLE_OPENAI_BASE": "https://api.groq.com/openai/v1",
+        "RIDDLE_OPENAI_MODEL": "qwen/qwen3.6-27b",
+        "RIDDLE_OPENAI_REASONING": "none"
+      }
+    },
+    {
+      "name": "Cerebras",
+      "values": {
+        "RIDDLE_OPENAI_BASE": "https://api.cerebras.ai/v1",
+        "RIDDLE_OPENAI_MODEL": "gemma-4-31b",
         "RIDDLE_OPENAI_REASONING": ""
       }
     }
