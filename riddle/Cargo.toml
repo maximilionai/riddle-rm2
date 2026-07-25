@@ -1,0 +1,24 @@
+[package]
+name = "riddle"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "The diary of Tom Riddle, for the reMarkable 2"
+
+[dependencies]
+libc = "0.2"
+signal-hook = "0.3"
+png = "0.17"
+ab_glyph = "0.2"
+# HTTP + TLS for the OpenAI-compatible oracle backend. Pure Rust (rustls), no
+# OpenSSL/C — keeps the binary self-contained and cross-compiles cleanly.
+ureq = { version = "2.10", default-features = false, features = ["tls"] }
+
+[features]
+# Link libquill.so (vendor e-ink engine C ABI) for full-takeover mode.
+# DEAD on the reMarkable 2 — enabling it is a compile error (see display.rs).
+takeover = []
+
+[profile.release]
+strip = true
+lto = true

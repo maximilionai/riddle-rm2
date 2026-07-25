@@ -1,0 +1,13 @@
+[Unit]
+Description=riddle five-finger-tap launcher
+After=xochitl.service
+
+[Service]
+ExecStart=/home/root/riddle/riddle-gesture
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

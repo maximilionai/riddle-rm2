@@ -1,0 +1,29 @@
+# build output
+target/
+target-docker/
+build/
+build-native/
+*.o
+*.so
+!/**/*.xovi
+dist/
+
+# never commit: proprietary reMarkable material
+xochitl*
+*.wbf
+qml-full/
+device-libs/
+qt-sysroot/
+sdk-*/
+*toolchain*.sh
+
+# never commit: generated from proprietary QML
+hashtab*
+
+# secrets
+oracle.env
+*.pem
+id_rsa*
+id_ed25519*
+
+.DS_Store

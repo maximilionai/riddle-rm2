@@ -1,0 +1,29 @@
+fbcontroller — qtfb server + FBController for reMarkable 2
+==========================================================
+
+This directory is a derivative work of the qtfb component of
+
+    asivery/rm-appload   https://github.com/asivery/rm-appload
+    (src/qtfb/*)
+
+which is licensed under the GNU General Public License version 3.
+This directory is therefore also GPL-3.0; see LICENSE.
+
+Upstream targets the reMarkable Paper Pro (aarch64, 1620x2160). Changes made
+here for the reMarkable 2 (armv7 ILP32, 1404x1872, Qt 6.5.2):
+
+  * qtfb_common.h  - wire structs pinned to the aarch64 layout with
+                     static_assert on every offset. Upstream relies on natural
+                     struct layout; `size_t shmSize` is 8 bytes on aarch64 but
+                     4 on armv7, which silently breaks the handshake.
+  * FBController   - RenderTarget::Image (the i.MX7 has no 3D GPU);
+                     setActiveFocusOnTab instead of setFocusPolicy (Qt 6.7+);
+                     update() is given an explicit bounding rect, because
+                     update(QRect()) is a no-op while the dirty rect is empty.
+  * fbmanagement   - MSG_NOSIGNAL so a dying client cannot SIGPIPE xochitl;
+                     wildcard re-keying, since there is no AppLoad on this
+                     device to agree a framebuffer key in advance.
+  * screenmode.*   - NEW. Parents an EPScreenMode item onto the overlay so
+                     xochitl selects the fast e-ink waveform for our region.
+  * entry.cpp      - NEW. xovi entry point; attaches to the QQuickWindow's
+                     contentItem from C++, so no QML patching is required.
