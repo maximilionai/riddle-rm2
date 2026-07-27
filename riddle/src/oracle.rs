@@ -85,6 +85,8 @@ pub struct StreamParser {
     route_checked: bool,
     showed: bool,
     emitted_any: bool,
+    /// A draw block arrived and closed, even if it held no ops.
+    saw_block: bool,
     catalog_ids: Vec<u64>,
 }
 
@@ -103,6 +105,7 @@ impl StreamParser {
             route_checked: false,
             showed: false,
             emitted_any: false,
+            saw_block: false,
             catalog_ids,
         }
     }
@@ -215,6 +218,11 @@ impl StreamParser {
                         if dropped > 0 {
                             eprintln!("riddle: draw block dropped {dropped} unparseable line(s)");
                         }
+                        // An EMPTY block is a real answer, not a failure: the
+                        // model is told that returning no marks is the right
+                        // move when nothing needs marking. Only "no block at
+                        // all" is an empty reply.
+                        self.saw_block = true;
                         if !ops.is_empty() {
                             self.emitted_any = true;
                             out.push(Ok(Event::Draw(ops)));
@@ -249,7 +257,7 @@ impl StreamParser {
                     out.push(Ok(Event::Transcript(t.to_string())));
                 }
             }
-            if !self.emitted_any {
+            if !self.emitted_any && !self.saw_block {
                 out.push(Err("empty reply".into()));
             }
         }

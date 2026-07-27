@@ -9,6 +9,8 @@
 //!   index.tsv        one line per memory: id \t transcript \t reply
 //!                    (tabs/newlines/backslashes escaped)
 //!   <id>.strokes     the pen strokes: one line per stroke, "x,y,r;x,y,r;…"
+//!   <id>.marks       the diary's own marks: one op per line, opaque here —
+//!                    memory.rs stores them, ops.rs decides what they say
 //!
 //! Delete the directory and the diary forgets. `RIDDLE_MEMORY=off` disables
 //! remembering entirely (no storage, no context sent with requests).
@@ -64,6 +66,10 @@ impl MemoryStore {
         self.dir.join(format!("{id}.strokes"))
     }
 
+    fn marks_path(&self, id: u64) -> PathBuf {
+        self.dir.join(format!("{id}.marks"))
+    }
+
     fn load(&mut self) {
         let Ok(text) = std::fs::read_to_string(self.index_path()) else { return };
         for line in text.lines() {
@@ -117,6 +123,7 @@ impl MemoryStore {
         let drop_n = self.entries.len() - MAX_MEMORIES;
         for e in &self.entries[..drop_n] {
             let _ = std::fs::remove_file(self.strokes_path(e.id));
+            let _ = std::fs::remove_file(self.marks_path(e.id));
         }
         self.entries.drain(..drop_n);
         let mut out = String::new();
@@ -148,6 +155,32 @@ impl MemoryStore {
             }
         }
         Some(strokes)
+    }
+
+    /// Persist the diary's own marks for a page, beside its strokes.
+    pub fn save_marks(&self, id: u64, lines: &[String]) {
+        if lines.is_empty() {
+            // Erasing every mark must not leave the previous turn's file to be
+            // re-read on the next visit to the page.
+            let _ = std::fs::remove_file(self.marks_path(id));
+            return;
+        }
+        let mut out = String::new();
+        for l in lines {
+            // A note op carries free text; escaping keeps a newline inside it
+            // from becoming two half-marks on load. Round-trips exactly.
+            out.push_str(&escape(l));
+            out.push('\n');
+        }
+        if let Err(e) = std::fs::write(self.marks_path(id), out) {
+            eprintln!("riddle: memory marks not kept: {e}");
+        }
+    }
+
+    /// The marks kept for a page, or empty if none were.
+    pub fn load_marks(&self, id: u64) -> Vec<String> {
+        let Ok(text) = std::fs::read_to_string(self.marks_path(id)) else { return Vec::new() };
+        text.lines().filter(|l| !l.trim().is_empty()).map(unescape).collect()
     }
 
     pub fn get(&self, id: u64) -> Option<&Entry> {
@@ -343,6 +376,47 @@ mod tests {
         assert_eq!(s.entries[0].id, 6);
         assert!(!s.strokes_path(1).exists());
         assert!(s.strokes_path(6).exists());
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn marks_round_trip_awkward_text() {
+        let s = tmp_store("marks-rt");
+        let lines = vec![
+            r#"note 120 340 "the tea, he said — \"twice\"" 0 0 1404 1872"#.to_string(),
+            "circle 10 20 30 40 0 0 1404 1872".to_string(),
+        ];
+        s.save_marks(7, &lines);
+        assert_eq!(s.load_marks(7), lines);
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn marks_overwritten_with_none_are_gone() {
+        let s = tmp_store("marks-empty");
+        s.save_marks(7, &["box 1 2 3 4".to_string()]);
+        s.save_marks(7, &[]);
+        assert!(!s.marks_path(7).exists(), "stale sidecar would resurrect erased marks");
+        assert!(s.load_marks(7).is_empty());
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn marks_of_unmarked_page_are_empty() {
+        let s = tmp_store("marks-missing");
+        assert!(s.load_marks(999).is_empty());
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn prune_forgets_marks_too() {
+        let mut s = tmp_store("marks-prune");
+        for i in 0..(MAX_MEMORIES + 5) as u64 {
+            s.append(i + 1, "t", "r", &vec![vec![(1, 1, 1)]]);
+            s.save_marks(i + 1, &["underline 1 2 3 4".to_string()]);
+        }
+        assert!(!s.marks_path(1).exists());
+        assert!(s.marks_path(6).exists());
         let _ = std::fs::remove_dir_all(&s.dir);
     }
 

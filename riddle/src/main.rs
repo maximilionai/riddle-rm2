@@ -103,6 +103,27 @@ struct WritePlan {
     region: BBox,
     /// Where the next streamed chunk's first line starts.
     next_y: i32,
+    /// Ink colour. Annotation marks are drawn lighter than the writer's own
+    /// hand: on a shared canvas both parties draw, and neither the writer nor
+    /// the model can tell whose mark is whose from a flat black page.
+    shade: u16,
+}
+
+/// One mark the diary has made, kept as structure rather than as pixels.
+///
+/// The pixels alone are not enough state. The eraser used to whiten a mark
+/// while its op stayed live in layer 1, so the page and the model's idea of the
+/// page silently diverged; and removing one mark means redrawing the page from
+/// the layers, which needs the strokes kept.
+struct Mark {
+    op: ops::Op,
+    /// The crop it was authored against — its coordinates mean nothing without.
+    view: ink::PageView,
+    strokes: Vec<Vec<(i32, i32)>>,
+    bbox: BBox,
+    /// The writer has since drawn on or beside this mark. This is the round
+    /// trip: it is how the model learns which of its marks were answered.
+    answered: bool,
 }
 
 /// Load `oracle.env` from beside the binary into this process's environment.
@@ -343,15 +364,25 @@ fn draw_test(spec: Option<&str>) -> i32 {
 /// the catalog the oracle picks conjured pages from. Empty when memory is off.
 fn build_ctx(
     store: &Option<memory::MemoryStore>,
-    page_ops: &[(ops::Op, ink::PageView)],
+    page_marks: &[Mark],
     now: Option<&ink::PageView>,
 ) -> oracle::TurnContext {
     // Re-express every prior mark in THIS turn's crop before describing it,
-    // or the numbers contradict the image the model is looking at.
+    // or the numbers contradict the image the model is looking at. A mark the
+    // writer has drawn on is flagged: that is the whole round trip, and it is
+    // the difference between "you marked this" and "you marked this and they
+    // answered you".
     let prior_ops: Vec<String> = match now {
-        Some(now) => page_ops
+        Some(now) => page_marks
             .iter()
-            .map(|(o, from)| ops::reproject(o, from, now).to_line())
+            .map(|m| {
+                let line = ops::reproject(&m.op, &m.view, now).to_line();
+                if m.answered {
+                    format!("{line}   <- the writer has since written on this one")
+                } else {
+                    line
+                }
+            })
             .collect(),
         None => Vec::new(),
     };
@@ -440,10 +471,6 @@ fn run() -> std::io::Result<()> {
     // ink is NOT drunk (the marks have to point at something) and the marks are
     // not faded (the writer answers them on the next turn).
     let annotating = oracle.as_ref().is_some_and(|o| o.annotating());
-    // Where the diary's own marks currently sit. Not part of `user_ink`, so
-    // without tracking it separately the next crop would cut them off and the
-    // model would lose sight of its own previous turn.
-    let mut marks = BBox::empty();
     // The crop the model last saw. Every coordinate it returns is in this
     // space; without it a reply cannot be mapped back onto the page.
     let mut page_view: Option<ink::PageView> = None;
@@ -452,7 +479,7 @@ fn run() -> std::io::Result<()> {
     // previous annotations instead of re-reading them out of the image.
     // Each mark with the crop it was authored against: the crop moves as the
     // page fills, so the raw numbers only mean something next to their view.
-    let mut page_ops: Vec<(ops::Op, ink::PageView)> = Vec::new();
+    let mut page_marks: Vec<Mark> = Vec::new();
     // Raw stylus contact, tracked in every state (the guide dismisses on it).
     // `stylus_on` is the level; `stylus_tapped` latches any contact seen this
     // loop iteration, so a tap that starts AND ends within one drain still
@@ -565,17 +592,24 @@ fn run() -> std::io::Result<()> {
                     State::Listening { ref mut last_pen } => {
                         // The clear button is checked before any ink is laid
                         // down, so tapping it never leaves a stroke behind.
-                        if annotating && !clear_button().is_empty() && {
-                            let b = clear_button();
-                            s.x >= b.x0 && s.x <= b.x1 && s.y >= b.y0 && s.y <= b.y1
-                        } {
+                        if annotating && hit(clear_button(), s.x, s.y) {
                             clear_page(&mut surf, &disp);
                             user_ink.clear();
-                            marks = BBox::empty();
-                            page_ops.clear();
+                            page_marks.clear();
                             page_view = None;
                             *last_pen = None;
                             eprintln!("riddle: page cleared");
+                            continue;
+                        }
+                        if annotating && hit(undo_button(), s.x, s.y) {
+                            match page_marks.pop() {
+                                Some(m) => {
+                                    eprintln!("riddle: undid {}", m.op.to_line());
+                                    recompose(&mut surf, &disp, &user_ink, &page_marks, annotating);
+                                }
+                                None => eprintln!("riddle: nothing to undo"),
+                            }
+                            *last_pen = None;
                             continue;
                         }
                         pen_down = true;
@@ -584,7 +618,15 @@ fn run() -> std::io::Result<()> {
                                 let r = 2 + s.pressure * 3 / pen::MAX_PRESSURE;
                                 user_ink.pen_point(&mut surf, s.x, s.y, r)
                             }
-                            pen::Tool::Eraser => user_ink.erase_point(&mut surf, s.x, s.y, ERASER_R),
+                            pen::Tool::Eraser => {
+                                // Rubbing out a mark must take the op with it,
+                                // or the diary keeps telling the model about a
+                                // mark the writer has already removed.
+                                if erase_marks_near(&mut page_marks, s.x, s.y, ERASER_R) {
+                                    recompose(&mut surf, &disp, &user_ink, &page_marks, annotating);
+                                }
+                                user_ink.erase_point(&mut surf, s.x, s.y, ERASER_R)
+                            }
                         };
                         if !d.is_empty() {
                             ink_dirty.add(d.x0, d.y0, 0);
@@ -692,7 +734,7 @@ fn run() -> std::io::Result<()> {
                         // sent. The reply path keeps the tight crop (0.0), so
                         // its token cost is unchanged.
                         let pad = if annotating { 0.15 } else { 0.0 };
-                        match user_ink.to_png(&surf, PNG_PATH, pad, marks) {
+                        match user_ink.to_png(&surf, PNG_PATH, pad, marks_bbox(&page_marks)) {
                             Ok(v) => page_view = Some(v),
                             Err(e) => {
                                 eprintln!("riddle: rasterize failed: {e}");
@@ -711,9 +753,10 @@ fn run() -> std::io::Result<()> {
                         turn_failed = false;
                         // Ask NOW: the model streams while the diary drinks the
                         // ink, hiding most of the reply latency in the animation.
+                        note_answered(&mut page_marks, &user_ink);
                         let (tx, rx) = mpsc::channel();
                         if let Some(ref o) = oracle {
-                            o.ask(PNG_PATH, &build_ctx(&store, &page_ops, page_view.as_ref()), tx);
+                            o.ask(PNG_PATH, &build_ctx(&store, &page_marks, page_view.as_ref()), tx);
                         }
                         // Both backends read the page before ask() returns; the
                         // writer's words don't need to sit on disk afterwards.
@@ -778,12 +821,8 @@ fn run() -> std::io::Result<()> {
                             }
                         }
                         Ok(Event::Draw(ops)) => {
-                            let plan = plan_marks(&font, &ops, page_view.as_ref(), &surf);
-                            marks.add(plan.region.x0, plan.region.y0, 0);
-                            marks.add(plan.region.x1, plan.region.y1, 0);
-                            if let Some(v) = page_view {
-                                page_ops.extend(ops.iter().map(|o| (o.clone(), v)));
-                            }
+                            let (plan, made) = plan_each(&font, &ops, page_view.as_ref(), &surf);
+                            page_marks.extend(made);
                             State::Replying { plan, next: Instant::now(), rx: Some(rx) }
                         }
                         // Prose has nowhere to go in annotation mode.
@@ -838,7 +877,21 @@ fn run() -> std::io::Result<()> {
                         State::Thinking { rx, pulse, blot_on, since }
                     }
                 }
-                Err(mpsc::TryRecvError::Disconnected) => State::Listening { last_pen: None },
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // The turn ended without a single event — in annotation
+                    // mode that is the model correctly deciding the page needs
+                    // no mark. Wipe the pulsing blot on the way out, or the
+                    // "nothing to add" answer leaves a dot at the page centre.
+                    surf.fill_rect(SCREEN_W / 2 - BLOT, SCREEN_H / 2 - BLOT, BLOT * 2, BLOT * 2, WHITE);
+                    disp.update(
+                        SCREEN_W as i32 / 2 - BLOT as i32,
+                        SCREEN_H as i32 / 2 - BLOT as i32,
+                        BLOT as i32 * 2,
+                        BLOT as i32 * 2,
+                        true,
+                    );
+                    State::Listening { last_pen: None }
+                }
             },
 
             State::Replying { mut plan, next, mut rx } => {
@@ -850,16 +903,12 @@ fn run() -> std::io::Result<()> {
                         // ⟦draw …⟧" is the natural shape — so they splice into
                         // a running animation the same way more text does.
                         Ok(Ok(Event::Draw(more_ops))) => {
-                            let add = plan_marks(&font, &more_ops, page_view.as_ref(), &surf);
+                            let (add, made) = plan_each(&font, &more_ops, page_view.as_ref(), &surf);
                             if !add.strokes.is_empty() {
                                 plan.region.add(add.region.x0, add.region.y0, 0);
                                 plan.region.add(add.region.x1, add.region.y1, 0);
-                                marks.add(add.region.x0, add.region.y0, 0);
-                                marks.add(add.region.x1, add.region.y1, 0);
                                 plan.strokes.extend(add.strokes);
-                                if let Some(v) = page_view {
-                                    page_ops.extend(more_ops.iter().map(|o| (o.clone(), v)));
-                                }
+                                page_marks.extend(made);
                             }
                             false
                         }
@@ -914,9 +963,9 @@ fn run() -> std::io::Result<()> {
                         let (x, y) = stroke[plan.point_i];
                         if plan.point_i > 0 {
                             let (px, py) = stroke[plan.point_i - 1];
-                            surf.brush_line(px, py, x, y, 2, BLACK);
+                            surf.brush_line(px, py, x, y, 2, plan.shade);
                         } else {
-                            surf.stamp(x, y, 2, BLACK);
+                            surf.stamp(x, y, 2, plan.shade);
                         }
                         dirty.add(x, y, 4);
                         plan.point_i += 1;
@@ -936,6 +985,20 @@ fn run() -> std::io::Result<()> {
                                     turn_reply.trim(),
                                     &turn_strokes,
                                 );
+                                // Layer 1 keeps the crop each mark was made
+                                // against; without it the coordinates cannot be
+                                // reprojected when the page is read back.
+                                let lines: Vec<String> = page_marks
+                                    .iter()
+                                    .map(|m| {
+                                        format!(
+                                            "{} {} {} {} {}\t{}",
+                                            m.view.x0, m.view.y0, m.view.f, m.view.w, m.view.h,
+                                            m.op.to_line()
+                                        )
+                                    })
+                                    .collect();
+                                s.save_marks(turn_id, &lines);
                             }
                         }
                         turn_strokes = Vec::new();
@@ -1211,7 +1274,7 @@ fn plan_reply(font: &FontRef, text: &str, y_start: Option<i32>) -> WritePlan {
         y += line_h;
     }
 
-    WritePlan { strokes, stroke_i: 0, point_i: 0, region, next_y: y }
+    WritePlan { strokes, stroke_i: 0, point_i: 0, region, next_y: y, shade: BLACK }
 }
 
 /// Half-size of the clear button's touch target, top-right of the page.
@@ -1230,7 +1293,22 @@ fn clear_button() -> BBox {
     b
 }
 
-fn draw_clear_button(surf: &mut Surface, disp: &display::Display) {
+/// Undo sits under the clear button. Touch gestures are not an option here:
+/// `touch::TouchDevice` is only opened in takeover mode, and the rM2 runs under
+/// qtfb, so two-finger-tap-to-undo never reaches this process.
+fn undo_button() -> BBox {
+    let c = clear_button();
+    let mut b = BBox::empty();
+    b.add(c.x0, c.y1 + fb::s(24), 0);
+    b.add(c.x1, c.y1 + fb::s(24) + (c.y1 - c.y0), 0);
+    b
+}
+
+fn hit(b: BBox, x: i32, y: i32) -> bool {
+    !b.is_empty() && x >= b.x0 && x <= b.x1 && y >= b.y0 && y <= b.y1
+}
+
+fn draw_buttons(surf: &mut Surface, disp: &display::Display) {
     let b = clear_button();
     let (x, y, w, h) = b.rect();
     let inset = fb::s(16);
@@ -1238,6 +1316,30 @@ fn draw_clear_button(surf: &mut Surface, disp: &display::Display) {
     surf.brush_line(x + inset, y + inset, x + w - inset, y + h - inset, 2, FADED);
     surf.brush_line(x + w - inset, y + inset, x + inset, y + h - inset, 2, FADED);
     disp.update(x, y, w, h, false);
+
+    // Undo: an arc with a head, drawn the same weight as the X.
+    let u = undo_button();
+    let (ux, uy, uw, uh) = u.rect();
+    let (cx, cy) = (ux + uw / 2, uy + uh / 2);
+    let r = (uw.min(uh) / 2 - fb::s(14)) as f32;
+    let mut prev: Option<(i32, i32)> = None;
+    let mut a = -0.6f32;
+    while a < 4.4 {
+        let p = (cx + (r * a.cos()) as i32, cy + (r * a.sin()) as i32);
+        if let Some(q) = prev {
+            surf.brush_line(q.0, q.1, p.0, p.1, 2, FADED);
+        }
+        prev = Some(p);
+        a += 0.12;
+    }
+    let head = (cx + (r * (-0.6f32).cos()) as i32, cy + (r * (-0.6f32).sin()) as i32);
+    surf.brush_line(head.0, head.1, head.0 - fb::s(13), head.1 - fb::s(3), 2, FADED);
+    surf.brush_line(head.0, head.1, head.0 + fb::s(3), head.1 - fb::s(13), 2, FADED);
+    disp.update(ux, uy, uw, uh, false);
+}
+
+fn draw_clear_button(surf: &mut Surface, disp: &display::Display) {
+    draw_buttons(surf, disp);
 }
 
 /// Wipe the page back to blank paper and forget both layers.
@@ -1249,6 +1351,97 @@ fn clear_page(surf: &mut Surface, disp: &display::Display) {
     surf.fill_rect(0, 0, SCREEN_W, SCREEN_H, WHITE);
     draw_clear_button(surf, disp);
     disp.update(0, 0, SCREEN_W as i32, SCREEN_H as i32, false);
+}
+
+/// The region the diary's own marks occupy, for the crop sent to the model.
+fn marks_bbox(marks: &[Mark]) -> BBox {
+    let mut b = BBox::empty();
+    for m in marks {
+        if !m.bbox.is_empty() {
+            b.add(m.bbox.x0, m.bbox.y0, 0);
+            b.add(m.bbox.x1, m.bbox.y1, 0);
+        }
+    }
+    b
+}
+
+/// Redraw the whole page from the two layers.
+///
+/// Removing a mark cannot be done by un-drawing it — the marks cross the
+/// writer's ink, so whitening a mark's pixels takes the writing with it. The
+/// layers are authoritative and the page is derived from them, which is the
+/// only way erase and undo can be correct.
+fn recompose(
+    surf: &mut Surface,
+    disp: &display::Display,
+    user: &ink::Ink,
+    marks: &[Mark],
+    annotating: bool,
+) {
+    surf.fill_rect(0, 0, SCREEN_W, SCREEN_H, WHITE);
+    for stroke in user.stroke_list() {
+        for (i, &(x, y, r)) in stroke.iter().enumerate() {
+            if i > 0 {
+                let (px, py, pr) = stroke[i - 1];
+                surf.brush_line(px, py, x, y, r.min(pr + 1), BLACK);
+            } else {
+                surf.stamp(x, y, r, BLACK);
+            }
+        }
+    }
+    for m in marks {
+        for stroke in &m.strokes {
+            for (i, &(x, y)) in stroke.iter().enumerate() {
+                if i > 0 {
+                    let (px, py) = stroke[i - 1];
+                    surf.brush_line(px, py, x, y, 2, FADED);
+                } else {
+                    surf.stamp(x, y, 2, FADED);
+                }
+            }
+        }
+    }
+    if annotating {
+        draw_clear_button(surf, disp);
+    }
+    // Full, non-flashing: a page this old has accumulated ghosts that a
+    // partial update would keep.
+    disp.update(0, 0, SCREEN_W as i32, SCREEN_H as i32, false);
+}
+
+/// Drop every mark the eraser tip is touching. Returns whether any went.
+///
+/// Without this the eraser whitens a mark's pixels but leaves its op live in
+/// layer 1, so the page and the state the model is told about drift apart — the
+/// writer rubs a mark out and the diary keeps insisting it is there.
+fn erase_marks_near(marks: &mut Vec<Mark>, x: i32, y: i32, r: i32) -> bool {
+    let r2 = (r + 4) * (r + 4);
+    let before = marks.len();
+    marks.retain(|m| {
+        !m.strokes.iter().flatten().any(|&(mx, my)| {
+            let (dx, dy) = (mx - x, my - y);
+            dx * dx + dy * dy <= r2
+        })
+    });
+    before != marks.len()
+}
+
+/// Note which marks the writer has since drawn on. That is the round trip: the
+/// model gets told which of its marks were answered, rather than having to spot
+/// fresh ink near old geometry in a flattened raster.
+fn note_answered(marks: &mut [Mark], user: &ink::Ink) {
+    for m in marks {
+        if m.answered || m.bbox.is_empty() {
+            continue;
+        }
+        let near = fb::s(40);
+        m.answered = user.stroke_list().iter().flatten().any(|&(x, y, _)| {
+            x >= m.bbox.x0 - near
+                && x <= m.bbox.x1 + near
+                && y >= m.bbox.y0 - near
+                && y <= m.bbox.y1 + near
+        });
+    }
 }
 
 /// Turn annotation ops into a write plan. The animator is modality-agnostic —
@@ -1270,6 +1463,7 @@ fn plan_marks(
         point_i: 0,
         region: BBox::empty(),
         next_y: 0,
+        shade: FADED,
     };
     let Some(view) = view else {
         eprintln!("riddle: marks arrived with no page view; dropping {}", marks.len());
@@ -1287,7 +1481,47 @@ fn plan_marks(
             lowest = lowest.max(y);
         }
     }
-    WritePlan { strokes, stroke_i: 0, point_i: 0, region, next_y: lowest }
+    WritePlan { strokes, stroke_i: 0, point_i: 0, region, next_y: lowest, shade: FADED }
+}
+
+/// Render each op separately, so every mark keeps the strokes that are its
+/// own. A single combined plan animates fine but cannot be taken apart again,
+/// and erase and undo both need to remove exactly one mark.
+///
+/// Returns the plan to animate and the marks to remember. The marks are capped:
+/// a model that returns a dozen ops would otherwise bury the page under a turn
+/// that takes ten seconds to draw.
+fn plan_each(
+    font: &FontRef,
+    ops: &[ops::Op],
+    view: Option<&ink::PageView>,
+    page: &Surface,
+) -> (WritePlan, Vec<Mark>) {
+    const MAX_MARKS: usize = 3;
+    let mut plan = plan_marks(font, &[], view, page);
+    let mut marks = Vec::new();
+    let Some(v) = view else { return (plan, marks) };
+    if ops.len() > MAX_MARKS {
+        eprintln!("riddle: {} marks offered, keeping {MAX_MARKS}", ops.len());
+    }
+    for op in ops.iter().take(MAX_MARKS) {
+        let one = plan_marks(font, std::slice::from_ref(op), Some(v), page);
+        if one.strokes.is_empty() {
+            continue;
+        }
+        plan.region.add(one.region.x0, one.region.y0, 0);
+        plan.region.add(one.region.x1, one.region.y1, 0);
+        plan.next_y = plan.next_y.max(one.next_y);
+        marks.push(Mark {
+            op: op.clone(),
+            view: *v,
+            strokes: one.strokes.clone(),
+            bbox: one.region,
+            answered: false,
+        });
+        plan.strokes.extend(one.strokes);
+    }
+    (plan, marks)
 }
 
 /// Splice a streamed continuation chunk into a running write animation.
