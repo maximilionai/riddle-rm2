@@ -23,6 +23,10 @@ pub struct Surface {
 // Single-threaded writer over a long-lived mapping.
 unsafe impl Send for Surface {}
 
+/// Row length (bytes) above which a `memset` call beats writing the pixels
+/// inline. Below it the call setup dominates — which is the brush's whole life.
+const MEMSET_WORTH_IT: usize = 64;
+
 pub const WHITE: u16 = 0xFFFF;
 pub const BLACK: u16 = 0x0000;
 /// Old ink: how the diary writes its memories (a readable e-ink gray).
@@ -126,24 +130,30 @@ impl Surface {
         match fmt {
             PixFmt::Rgb565 => {
                 let p = c.to_le_bytes();
-                // WHITE and BLACK are byte-uniform, so the hot cases become a
-                // memset; FADED and friends fall back to a 2-byte stamp.
-                if p[0] == p[1] {
+                // WHITE and BLACK are byte-uniform, so a page-sized row becomes
+                // a memset. Only for a page-sized row, though: a brush stamp is
+                // a span of a few pixels, where the call setup costs more than
+                // the bytes it moves.
+                if row.len() >= MEMSET_WORTH_IT && p[0] == p[1] {
                     row.fill(p[0]);
                 } else {
                     for px in row.chunks_exact_mut(2) {
-                        px.copy_from_slice(&p);
+                        px[0] = p[0];
+                        px[1] = p[1];
                     }
                 }
             }
             PixFmt::Rgb32 => {
                 let (r, g, b) = expand565(c);
                 let p = [b, g, r, 0xFF];
-                if p[0] == p[1] && p[1] == p[2] && p[2] == p[3] {
+                if row.len() >= MEMSET_WORTH_IT && p[0] == p[1] && p[1] == p[2] && p[2] == p[3] {
                     row.fill(p[0]);
                 } else {
                     for px in row.chunks_exact_mut(4) {
-                        px.copy_from_slice(&p);
+                        px[0] = p[0];
+                        px[1] = p[1];
+                        px[2] = p[2];
+                        px[3] = p[3];
                     }
                 }
             }
@@ -228,15 +238,29 @@ impl Surface {
             return;
         }
         let r2 = r * r;
+        // Half-width of the disc at this row: the largest `half` with
+        // `half² + dy² <= r²`, i.e. the same test the per-pixel version made,
+        // carried between rows instead of recomputed.
+        //
+        // This was a `f64::sqrt` — correct, and fine on the host, but the
+        // Cortex-A7's VSQRT.F64 is unpipelined and costs tens of cycles, and
+        // the brush runs at r=2..5 where that is most of the work. Five slow
+        // square roots to save twenty integer compares is a bad trade on the
+        // one CPU this actually ships on. The walk below is a couple of integer
+        // ops per row, amortised, and has no floating point in it at all.
+        let mut half = 0i32;
         for dy in -r..=r {
+            let rem = r2 - dy * dy;
+            while half > 0 && half * half > rem {
+                half -= 1;
+            }
+            while (half + 1) * (half + 1) <= rem {
+                half += 1;
+            }
             let y = cy + dy;
             if y < 0 || y >= self.h as i32 {
                 continue;
             }
-            // The old test was `dx*dx + dy*dy <= r*r`, i.e. |dx| <= sqrt(r²-dy²).
-            // IEEE-754 sqrt is correctly rounded, so a perfect square comes back
-            // exact and the truncation is a true floor — the disc is identical.
-            let half = ((r2 - dy * dy) as f64).sqrt() as i32;
             let x0 = (cx - half).max(0);
             let x1 = (cx + half).min(self.w as i32 - 1);
             if x0 > x1 {

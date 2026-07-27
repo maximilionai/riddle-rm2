@@ -36,13 +36,26 @@ const FONT_TTF: &[u8] = include_bytes!("../fonts/DancingScript.ttf");
 const PNG_PATH: &str = "/tmp/riddle-page.png";
 
 const IDLE_COMMIT: Duration = Duration::from_millis(2800);
-/// Longest the event loop will sleep with nothing scheduled.
+/// Longest the event loop will sleep once the writer has left the diary alone.
 ///
-/// The loop waits on the input descriptors rather than spinning, so an idle
-/// diary would otherwise sleep until the writer touches it — but SIGTERM is
+/// The loop waits on the input descriptors rather than spinning, so an
+/// untouched diary would otherwise sleep until it is touched — but SIGTERM is
 /// delivered with SA_RESTART, so `poll` does not return for it. This cap is
 /// what bounds how long the diary takes to notice it has been asked to close.
-const MAX_IDLE_WAIT: Duration = Duration::from_millis(250);
+/// Override with `RIDDLE_IDLE_MS`.
+const IDLE_WAIT_MS: u64 = 250;
+/// Longest the loop will sleep while the writer is still at the page.
+///
+/// Deliberately the old unconditional tick. Sleeping properly between pen
+/// samples lets the i.MX7 drop its clock and enter a deeper idle state, and
+/// then the first strokes of a gesture are drawn by a CPU that is still
+/// ramping — the busy loop this replaced was, by accident, pinning the
+/// governor. So the diary only really sleeps once nobody is writing.
+/// Override with `RIDDLE_ACTIVE_MS`; setting both to 2 restores the old loop.
+const ACTIVE_WAIT_MS: u64 = 2;
+/// How long after the last pen or window event the writer still counts as
+/// present. Comfortably longer than the gap between two words.
+const ACTIVE_WINDOW: Duration = Duration::from_secs(4);
 /// Floor on every wait — the tick this loop used to take unconditionally.
 const MIN_WAIT: Duration = Duration::from_millis(2);
 /// How often to look at the oracle's channel while `Thinking`.
@@ -460,7 +473,26 @@ fn run() -> std::io::Result<()> {
     .flatten()
     .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
     .collect();
-    eprintln!("riddle: waiting on {} input descriptor(s)", wait_set.len());
+    let ms_env = |k: &str, default: u64| -> Duration {
+        let v = std::env::var(k)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| (1..=2000).contains(v))
+            .unwrap_or(default);
+        Duration::from_millis(v)
+    };
+    let active_wait = ms_env("RIDDLE_ACTIVE_MS", ACTIVE_WAIT_MS);
+    let idle_wait = ms_env("RIDDLE_IDLE_MS", IDLE_WAIT_MS);
+    // Any pen or window event refreshes this; while it is recent the loop keeps
+    // ticking rather than sleeping, so the CPU stays awake under the writer's
+    // hand. See ACTIVE_WAIT_MS.
+    let mut last_input = Instant::now();
+    eprintln!(
+        "riddle: waiting on {} descriptor(s), tick {}ms writing / {}ms idle",
+        wait_set.len(),
+        active_wait.as_millis(),
+        idle_wait.as_millis()
+    );
 
     let sigterm = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm))?;
@@ -607,7 +639,13 @@ fn run() -> std::io::Result<()> {
 
         // ---- raw pen (preferred path) ----
         if let Some(ref mut pdev) = pen_dev {
-            for s in pdev.drain() {
+            let samples = pdev.drain();
+            // Hover counts: the pen coming into digitizer range is the writer
+            // arriving, and that is exactly when the CPU needs to be awake.
+            if !samples.is_empty() {
+                last_input = Instant::now();
+            }
+            for s in samples {
                 let writing = s.touching && s.pressure > 40;
                 stylus_on = writing;
                 stylus_tapped |= writing;
@@ -687,6 +725,9 @@ fn run() -> std::io::Result<()> {
             Ok(v) => v,
             Err(_) => break, // qtfb window closed
         };
+        if !events.is_empty() {
+            last_input = Instant::now();
+        }
         for ev in events {
             if pen_dev.is_some() {
                 continue;
@@ -1168,7 +1209,10 @@ fn run() -> std::io::Result<()> {
         // next tick, a pending ink flush, the oracle's channel, or a descriptor
         // becoming readable. Whichever comes first.
         let now = Instant::now();
-        let mut wake = now + MAX_IDLE_WAIT;
+        // Only let the CPU go properly idle once the writer has actually
+        // stopped; under the hand, keep the old tick.
+        let cap = if last_input.elapsed() < ACTIVE_WINDOW { active_wait } else { idle_wait };
+        let mut wake = now + cap;
         if let Some(d) = state_deadline(&state, user_ink.is_empty(), pen_down) {
             wake = wake.min(d);
         }
