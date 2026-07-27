@@ -181,7 +181,7 @@ impl PenDevice {
         })
     }
 
-    #[allow(dead_code)]
+    /// The evdev descriptor, so the event loop can wait on it rather than poll.
     pub fn raw_fd(&self) -> RawFd {
         self.fd
     }

@@ -136,6 +136,16 @@ impl Display {
         let _ = (w, h);
     }
 
+    /// The descriptor server messages arrive on, so the event loop can wait on
+    /// it. The takeover backend has no socket — it is polled by calling into
+    /// the vendor engine — so it contributes nothing to the wait set.
+    pub fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        match self {
+            Display::Qtfb(c) => Some(c.raw_fd()),
+            Display::Quill => None,
+        }
+    }
+
     /// Drain window-system events. For qtfb this also detects window close
     /// (returns Err); the takeover backend has no window to lose.
     pub fn pump(&self) -> io::Result<Vec<crate::qtfb::InputEvent>> {

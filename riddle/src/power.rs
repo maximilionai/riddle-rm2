@@ -41,6 +41,11 @@ impl PowerButton {
         ))
     }
 
+    /// The evdev descriptor, so the event loop can wait on it rather than poll.
+    pub fn raw_fd(&self) -> RawFd {
+        self.fd
+    }
+
     /// True if a power-key press (value 1) was seen since the last drain.
     pub fn drain_pressed(&mut self) -> bool {
         let mut pressed = false;

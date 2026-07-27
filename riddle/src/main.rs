@@ -36,6 +36,23 @@ const FONT_TTF: &[u8] = include_bytes!("../fonts/DancingScript.ttf");
 const PNG_PATH: &str = "/tmp/riddle-page.png";
 
 const IDLE_COMMIT: Duration = Duration::from_millis(2800);
+/// Longest the event loop will sleep with nothing scheduled.
+///
+/// The loop waits on the input descriptors rather than spinning, so an idle
+/// diary would otherwise sleep until the writer touches it — but SIGTERM is
+/// delivered with SA_RESTART, so `poll` does not return for it. This cap is
+/// what bounds how long the diary takes to notice it has been asked to close.
+const MAX_IDLE_WAIT: Duration = Duration::from_millis(250);
+/// Floor on every wait — the tick this loop used to take unconditionally.
+const MIN_WAIT: Duration = Duration::from_millis(2);
+/// How often to look at the oracle's channel while `Thinking`.
+///
+/// An `mpsc::Receiver` cannot be handed to `poll`, so the one state that waits
+/// on the model rather than on the panel or the pen still has to check by hand.
+/// 10ms is invisible against a network round trip and stops the loop spinning
+/// for the whole of `ORACLE_PATIENCE`. Giving the oracle a wakeup pipe would
+/// remove the last poll entirely.
+const ORACLE_POLL: Duration = Duration::from_millis(10);
 /// How long the diary waits on a silent oracle before giving up on the turn.
 /// Generous: thinking models can lead with a long silence.
 const ORACLE_PATIENCE: Duration = Duration::from_secs(120);
@@ -429,6 +446,21 @@ fn run() -> std::io::Result<()> {
     // Ignore power presses briefly after a wake: the waking press itself (and
     // key bounce) arrives on our grabbed fd and must not re-suspend.
     let mut power_grace = Instant::now();
+
+    // Everything the loop can be woken by. Built once: the set never changes,
+    // and the pen is by far the most important member — waiting on it instead
+    // of re-reading it every 2ms is what takes the idle diary off the CPU.
+    let mut wait_set: Vec<libc::pollfd> = [
+        pen_dev.as_ref().map(|d| d.raw_fd()),
+        disp.raw_fd(),
+        touch_dev.as_ref().map(|d| d.raw_fd()),
+        power_dev.as_ref().map(|d| d.raw_fd()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+    .collect();
+    eprintln!("riddle: waiting on {} input descriptor(s)", wait_set.len());
 
     let sigterm = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm))?;
@@ -1131,12 +1163,83 @@ fn run() -> std::io::Result<()> {
         };
 
         stylus_tapped = false;
-        std::thread::sleep(Duration::from_millis(2));
+
+        // Sleep until the earliest thing that needs us: the state machine's own
+        // next tick, a pending ink flush, the oracle's channel, or a descriptor
+        // becoming readable. Whichever comes first.
+        let now = Instant::now();
+        let mut wake = now + MAX_IDLE_WAIT;
+        if let Some(d) = state_deadline(&state, user_ink.is_empty(), pen_down) {
+            wake = wake.min(d);
+        }
+        if !ink_dirty.is_empty() {
+            wake = wake.min(last_flush + flush_every);
+        }
+        if matches!(state, State::Thinking { .. }) {
+            wake = wake.min(now + ORACLE_POLL);
+        }
+        wait_for_input(&mut wait_set, wake.saturating_duration_since(now));
     }
 
     eprintln!("riddle: the diary closes");
     disp.terminate();
     Ok(())
+}
+
+/// When the state machine next has work to do regardless of any input.
+///
+/// Every state is either animating on a timer or waiting for a moment to pass,
+/// so this is what lets the loop sleep instead of spin: without it the diary
+/// woke 500 times a second to discover that nothing had happened.
+///
+/// `None` means "only input can change anything here" — and it has to be None
+/// whenever the deadline would be one the state machine declines to act on,
+/// because a deadline already in the past that never gets consumed is a
+/// zero-length sleep, i.e. a hard spin. `Listening` is exactly that case: it
+/// commits on the idle timer only if there is ink and the pen is up, and if the
+/// writer erases everything mid-page its `last_pen` stays set forever.
+fn state_deadline(state: &State, ink_empty: bool, pen_down: bool) -> Option<Instant> {
+    match state {
+        // Deliberately mirrors the commit guard in `run`'s state machine.
+        State::Listening { last_pen } => last_pen
+            .filter(|_| !ink_empty && !pen_down)
+            .map(|t| t + IDLE_COMMIT),
+        State::Drinking { next, .. } => Some(*next),
+        // The pulsing blot; the channel is handled by ORACLE_POLL.
+        State::Thinking { pulse, .. } => Some(*pulse + Duration::from_millis(600)),
+        State::Replying { next, .. } => Some(*next),
+        State::Lingering { until, .. } => Some(*until),
+        State::FadingReply { next, .. } => Some(*next),
+        State::Help { until, .. } => Some(*until),
+        State::Conjuring { next, .. } => Some(*next),
+        State::MemoryShown { until, .. } => Some(*until),
+    }
+}
+
+/// Sleep until one of `fds` has something to read or `timeout` elapses.
+///
+/// `fds` is built once — the descriptor set never changes over a run — and
+/// `revents` is cleared on the way in so a stale hangup cannot make this return
+/// instantly forever.
+fn wait_for_input(fds: &mut [libc::pollfd], timeout: Duration) {
+    // Never shorter than the sleep this loop used to take unconditionally. A
+    // deadline that has already passed computes to zero, and a zero-timeout
+    // poll in a loop is a spin — this is the backstop that makes the worst case
+    // no worse than the old 2ms tick, whatever state gets added later.
+    let timeout = timeout.max(MIN_WAIT);
+    if fds.is_empty() {
+        // No descriptors at all (takeover with no input devices): there is
+        // nothing to wait on, so fall back to sleeping out the deadline.
+        std::thread::sleep(timeout);
+        return;
+    }
+    for p in fds.iter_mut() {
+        p.revents = 0;
+    }
+    let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    // EINTR just means a signal arrived, which is exactly a reason to go round
+    // the loop again — there is no retry to do here.
+    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
 }
 
 /// True if the region no longer holds any dark pixels (fully erased).
@@ -1559,4 +1662,48 @@ fn append_reply(font: &FontRef, plan: &mut WritePlan, more: &str) {
     plan.region.add(cont.region.x1, cont.region.y1, 0);
     plan.strokes.extend(cont.strokes);
     plan.next_y = cont.next_y;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The loop sleeps until `state_deadline`, so a deadline the state machine
+    /// will not act on is a zero-length sleep — a spin at full tilt rather than
+    /// the old 2ms tick. `Listening` only commits with ink on the page and the
+    /// pen up, and this must agree with that guard exactly.
+    #[test]
+    fn listening_offers_no_deadline_it_will_not_act_on() {
+        let long_ago = Instant::now() - Duration::from_secs(60);
+        let listening = State::Listening { last_pen: Some(long_ago) };
+
+        // Ink down, pen up: the commit is genuinely due.
+        assert!(state_deadline(&listening, false, false).is_some());
+
+        // The writer rubbed the page out before the pause — `last_pen` stays
+        // set forever and nothing will ever consume it.
+        assert!(state_deadline(&listening, true, false).is_none());
+        // Still writing: pen events drive the loop, not the clock.
+        assert!(state_deadline(&listening, false, true).is_none());
+        // Never touched the page at all.
+        assert!(state_deadline(&State::Listening { last_pen: None }, true, false).is_none());
+    }
+
+    /// Every other state either animates on a timer or expires, so each one
+    /// must name a moment — otherwise the diary sleeps through its own
+    /// animation until the 250ms idle cap wakes it.
+    #[test]
+    fn timed_states_all_name_a_deadline() {
+        let soon = Instant::now() + Duration::from_millis(50);
+        let region = BBox::empty();
+        let states = [
+            State::Lingering { until: soon, region },
+            State::FadingReply { stage: 0, next: soon, region },
+            State::Help { panel: None, until: soon },
+            State::MemoryShown { saved: None, until: soon, region },
+        ];
+        for s in &states {
+            assert!(state_deadline(s, true, false).is_some(), "a timed state sleeps");
+        }
+    }
 }

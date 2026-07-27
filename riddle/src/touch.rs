@@ -90,6 +90,11 @@ impl TouchDevice {
         Err(io::Error::new(io::ErrorKind::NotFound, "no touch device"))
     }
 
+    /// The evdev descriptor, so the event loop can wait on it rather than poll.
+    pub fn raw_fd(&self) -> RawFd {
+        self.fd
+    }
+
     /// Panel Y (origin at the bottom of the page) -> screen Y.
     #[inline]
     fn screen_y(&self, raw: i32) -> i32 {

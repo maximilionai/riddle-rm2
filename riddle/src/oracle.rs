@@ -516,6 +516,11 @@ pub struct HttpOracle {
     remember: bool,
     /// RIDDLE_MODE=annotate: mark the page up instead of replying as Tom.
     pub annotate: bool,
+    /// Built once and cloned per turn. ureq's Agent keeps its connection pool
+    /// behind an Arc, so a clone reuses the live TLS session — the turn used to
+    /// build a fresh agent inside its own thread, which meant DNS, TCP and a
+    /// full TLS handshake before every single page could even be sent.
+    agent: ureq::Agent,
 }
 
 impl HttpOracle {
@@ -548,12 +553,20 @@ impl HttpOracle {
             .ok()
             .filter(|r| !r.trim().is_empty());
         let annotate = std::env::var("RIDDLE_MODE").is_ok_and(|m| m == "annotate");
+        // Guard rails on the socket: without them a dropped connection or a
+        // stalled SSE stream leaves the diary "thinking" forever. The read
+        // timeout is per-read, so a healthy stream can run long — only silence
+        // trips it (thinking models can lead with ~a minute).
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(90))
+            .build();
         eprintln!(
             "riddle: http oracle base={base} model={model} max_tokens={max_tokens} reasoning={} mode={}",
             reasoning.as_deref().unwrap_or("-"),
             if annotate { "annotate" } else { "diary" }
         );
-        Ok(Self { base, key, model, max_tokens, reasoning, remember, annotate })
+        Ok(Self { base, key, model, max_tokens, reasoning, remember, annotate, agent })
     }
 
     pub fn ask(&self, png_path: &str, ctx: &TurnContext, tx: Sender<Result<Event, String>>) {
@@ -565,6 +578,9 @@ impl HttpOracle {
             }
         };
         let (base, key, model) = (self.base.clone(), self.key.clone(), self.model.clone());
+        // Shares the pool with every other turn: the second page onward skips
+        // the handshake entirely and pays only the model's own latency.
+        let agent = self.agent.clone();
         let max_tokens = self.max_tokens;
         let reasoning_field = self
             .reasoning
@@ -599,15 +615,6 @@ impl HttpOracle {
         let catalog_ids = ctx.catalog_ids.clone();
 
         thread::spawn(move || {
-            // Guard rails on the socket: without them a dropped connection or
-            // a stalled SSE stream leaves the diary "thinking" forever. The
-            // read timeout is per-read, so a healthy stream can run long —
-            // only silence trips it (thinking models can lead with ~a minute).
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(std::time::Duration::from_secs(10))
-                .timeout_read(std::time::Duration::from_secs(90))
-                .build();
-
             // OpenAI chat-completions with a data-URI image part, streaming.
             // The token-cap field is provider-dependent: OpenAI's newest
             // models and Cerebras reject "max_tokens" and want
