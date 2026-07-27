@@ -377,7 +377,29 @@ const MARK_PX: f32 = fb::s(52) as f32;
 
 /// Margin notes are prose, but smaller than the diary's replies — a note that
 /// matches REPLY_PX reads as a second answer rather than a comment.
-const NOTE_PX: f32 = 54.0 * SCREEN_W as f32 / fb::REF_W as f32;
+/// Reference size for a margin note, in the same units as `REPLY_PX` (96).
+/// Below the reply size so a note still reads as a comment rather than a second
+/// answer, but not by as much as it first was — at 54 it came out too small to
+/// read comfortably on the panel.
+const NOTE_PX_REF: f32 = 72.0;
+
+/// Note size in device pixels. Overridable with `RIDDLE_NOTE_PX`, which takes a
+/// reference size on the same 96-is-the-reply scale, so it can be tuned on the
+/// tablet without a rebuild.
+fn note_px() -> f32 {
+    static PX: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *PX.get_or_init(|| {
+        let r = std::env::var("RIDDLE_NOTE_PX")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| (20.0..=200.0).contains(v))
+            .unwrap_or(NOTE_PX_REF);
+        if r != NOTE_PX_REF {
+            eprintln!("riddle: note size {r}");
+        }
+        r * SCREEN_W as f32 / fb::REF_W as f32
+    })
+}
 
 /// Keep a note off the panel edge; `to_screen` can put an anchor anywhere.
 const NOTE_MARGIN: i32 = fb::s(36);
@@ -653,12 +675,13 @@ fn overshoot(a: (f32, f32), b: (f32, f32)) -> [(f32, f32); 2] {
 fn note(font: &FontRef, text: &str, anchor: (i32, i32), seed: u32) -> Vec<Vec<(i32, i32)>> {
     let (ax, ay) = anchor;
     let max_w = (SCREEN_W as i32 - NOTE_MARGIN - ax).max(fb::s(320)) as f32;
-    let line_h = (NOTE_PX * 1.2) as i32;
+    let px = note_px();
+    let line_h = (px * 1.2) as i32;
     let mut hand = Hand::new(seed);
     let mut out = Vec::new();
     let mut y = ay;
-    for text in script::wrap(font, text, NOTE_PX, max_w) {
-        let mut raster = script::rasterize_line(font, &text, NOTE_PX);
+    for text in script::wrap(font, text, px, max_w) {
+        let mut raster = script::rasterize_line(font, &text, px);
         script::thin(&mut raster);
         // The anchor is where the model pointed, but a wide note anchored near
         // the right edge would pile up against the clamp in `walk`.
@@ -885,7 +908,7 @@ mod tests {
         let min_x = strokes.iter().flatten().map(|p| p.0).min().unwrap();
         let min_y = strokes.iter().flatten().map(|p| p.1).min().unwrap();
         assert!((min_x - ax).abs() < 20, "note x {min_x} against anchor {ax}");
-        assert!(min_y >= ay - 5 && min_y < ay + NOTE_PX as i32, "note y {min_y} against anchor {ay}");
+        assert!(min_y >= ay - 5 && min_y < ay + note_px() as i32, "note y {min_y} against anchor {ay}");
     }
 
     #[test]
