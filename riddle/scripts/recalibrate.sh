@@ -8,6 +8,10 @@
 # not merely expire, it actively moves marks off their targets — so re-run this
 # whenever that cap, the page pipeline, or the model changes.
 #
+# Last run 2026-07-27, gemma-4-31b, cap 1200 (f=2, 702x936): k = 1.0249, 18/18
+# samples. The same three targets at full 1404x1872 gave 1.0200, so the bias is
+# the model's own, not the downscale's, and one constant covers the whole f range.
+#
 #   set -a; . ./oracle.env; set +a; scripts/recalibrate.sh
 #
 # Knobs (all optional):

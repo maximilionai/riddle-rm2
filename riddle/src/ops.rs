@@ -192,16 +192,28 @@ pub fn reproject(op: &Op, from: &PageView, to: &PageView) -> Op {
 /// Per-model correction for the vertical scale the model actually answers in.
 ///
 /// Measured against gemma-4-31b on a synthetic page with known word boxes
-/// (`scripts/probe-grounding.py`): x lands within 0.5% everywhere, but y comes
-/// back consistently LONG — the error is ~0 at the top of the page and grows to
-/// ~2% at the bottom, which is a scale factor, not noise. 18 samples fitted
-/// k = 1.025, and dividing y by it moved every one of six word-level targets
-/// from outside its box to inside.
+/// (`scripts/recalibrate.sh`): x lands where it should, but y comes back
+/// consistently LONG — ~0 error at the top of the page growing to ~2% at the
+/// bottom, which is a scale, not an offset (fitting both puts the intercept
+/// well inside the noise). 18 samples give k = 1.0249, 10.7 sigma off unity,
+/// and dividing y by it takes word-level targets from 10/18 inside their box
+/// to 18/18.
 ///
-/// Left at 1.0 by default because it is fitted to ONE model on ONE synthetic
-/// page — font-rendered handwriting, evenly spaced, clean background. Set
-/// `RIDDLE_GROUND_Y_SCALE` per model, and re-measure on real pages before
-/// trusting it. x has its own knob for symmetry; it has never needed one.
+/// It is the model's own coordinate handling rather than an artifact of our
+/// downscaling: re-probing the same targets at full resolution barely moves the
+/// fit (1.0200 at f=1 against 1.0238 at f=2). That is what makes ONE constant
+/// safe now that `f` varies per page — the 2x floor is gone, so a small ink
+/// region and a full-page spread no longer share a scale factor.
+///
+/// x needs no correction. A through-origin fit suggests 1.0227, but that is an
+/// artifact of x_true spanning only 102..254, where a constant few-unit offset
+/// imitates a scale; the two-parameter fit puts the slope 0.1 sigma from unity,
+/// and the leftover scatter is per-word rather than positional, so no global
+/// constant can remove it.
+///
+/// Still left at 1.0 by default: this is ONE model on ONE synthetic page of
+/// font-rendered handwriting. Set `RIDDLE_GROUND_Y_SCALE` per model, and
+/// re-measure on real pages before trusting it.
 fn calibration() -> (f32, f32) {
     static CAL: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
     *CAL.get_or_init(|| {
