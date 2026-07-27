@@ -263,6 +263,20 @@ riddle sends the page as a PNG, so the model must do vision. Two non-obvious tra
 
 So the requirement is: vision **and** plain `content` deltas **at the real settings**.
 
+On the fast providers, that requirement leaves exactly one model each:
+
+| provider | base | model | reasoning |
+|---|---|---|---|
+| Groq | `https://api.groq.com/openai/v1` | `qwen/qwen3.6-27b` | `none` — **required** |
+| Cerebras | `https://api.cerebras.ai/v1` | `gemma-4-31b` | empty (off by default) |
+
+Everything else they serve is text-only. The Groq model thinks by default and
+Groq's default `reasoning_format` is `raw`, so without `RIDDLE_OPENAI_REASONING=none`
+its `<think>` block streams in as ordinary content — and the quill inks it.
+Cerebras accepts only base64 data URIs for images, which is what riddle sends,
+and it dropped `max_tokens` for `max_completion_tokens` (riddle retries on the
+400 automatically).
+
 ### Dead ends, so you don't repeat them
 
 | approach | why not |

@@ -473,9 +473,10 @@ impl HttpOracle {
 
             // OpenAI chat-completions with a data-URI image part, streaming.
             // The token-cap field is provider-dependent: OpenAI's newest
-            // models reject "max_tokens" and demand "max_completion_tokens",
-            // while many OpenAI-compatible servers only know "max_tokens".
-            // Send the widely-supported name first; retry once if corrected.
+            // models and Cerebras reject "max_tokens" and want
+            // "max_completion_tokens", while many OpenAI-compatible servers
+            // only know "max_tokens" (Groq takes either). Send the
+            // widely-supported name first; retry once if it is refused.
             let request = |cap_field: &str| {
                 let body = format!(
                     concat!(
@@ -508,7 +509,7 @@ impl HttpOracle {
             let resp = match request("max_tokens") {
                 Err(ureq::Error::Status(400, r)) => {
                     let detail = r.into_string().unwrap_or_default();
-                    if detail.contains("max_completion_tokens") {
+                    if rejects_max_tokens(&detail) {
                         eprintln!("riddle: endpoint wants max_completion_tokens; retrying");
                         request("max_completion_tokens")
                     } else {
@@ -566,6 +567,16 @@ impl HttpOracle {
             // tx drops here → the diary's receiver disconnects = reply complete.
         });
     }
+}
+
+/// Does this 400 body blame the `max_tokens` field? Two shapes in the wild:
+/// OpenAI names the replacement ("use 'max_completion_tokens' instead"), while
+/// a provider that simply dropped the old name reports only the offending
+/// field — Cerebras answers `"param":"max_tokens","message":"Extra inputs are
+/// not permitted"`, which never mentions the new name and so used to surface
+/// as a bare `http 400` instead of retrying. Either shape has the same fix.
+fn rejects_max_tokens(detail: &str) -> bool {
+    detail.contains("max_completion_tokens") || detail.contains("max_tokens")
 }
 
 /// Pull `choices[0].delta.content` out of one SSE `data:` JSON object.
@@ -808,6 +819,22 @@ mod tests {
         assert_eq!(sse_delta_content(line).as_deref(), Some("Déjà vu — oui"));
         let nl = r#"{"choices":[{"delta":{"content":"line\nbreak"}}]}"#;
         assert_eq!(sse_delta_content(nl).as_deref(), Some("line\nbreak"));
+    }
+
+    #[test]
+    fn max_tokens_rejection_triggers_the_retry() {
+        // OpenAI: the message names the replacement field.
+        assert!(rejects_max_tokens(
+            r#"{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."}}"#
+        ));
+        // Cerebras: the field was renamed away, so only the offender is named.
+        assert!(rejects_max_tokens(
+            r#"{"message":"Extra inputs are not permitted","type":"invalid_request_error","param":"max_tokens","code":"wrong_api_format"}"#
+        ));
+        // An unrelated 400 must not cost a pointless second request.
+        assert!(!rejects_max_tokens(
+            r#"{"error":{"message":"model `nope` does not exist"}}"#
+        ));
     }
 
     #[test]
