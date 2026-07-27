@@ -145,7 +145,16 @@ impl Ink {
         let y0 = (by - pad_y).max(0) as usize;
         let x1 = ((bx + bw + pad_x) as usize).min(surf.w);
         let y1 = ((by + bh + pad_y) as usize).min(surf.h);
-        let f = ((x1 - x0).max(y1 - y0)).div_ceil(800).max(2);
+        // How much detail the model gets. The reply path only needs the words
+        // read, so 800px (and never less than 2x down) keeps vision tokens
+        // cheap. Annotation also needs them LOCATED, and that costs precision:
+        // measured on a page with known word boxes, the same target grounded to
+        // 0.5% at full resolution and 1.3% once downscaled to 468px — inside
+        // its box at one scale, outside at the other. Annotate mode buys the
+        // detail back.
+        let cap = if pad_frac > 0.0 { 1200 } else { 800 };
+        let floor = if pad_frac > 0.0 { 1 } else { 2 };
+        let f = ((x1 - x0).max(y1 - y0)).div_ceil(cap).max(floor);
         let (w, h) = ((x1 - x0) / f, (y1 - y0) / f);
         if w == 0 || h == 0 {
             return Err(std::io::Error::other("ink region too small"));
