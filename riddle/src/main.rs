@@ -311,6 +311,7 @@ fn draw_test(spec: Option<&str>) -> i32 {
         SCREEN_W * 4,
         surface::PixFmt::Rgb32,
     );
+    paint_buttons(&mut surf);
     // Exactly what the animator does, with the 14ms pacing taken out.
     let mut points = 0usize;
     for s in &strokes {
@@ -1309,33 +1310,57 @@ fn hit(b: BBox, x: i32, y: i32) -> bool {
 }
 
 fn draw_buttons(surf: &mut Surface, disp: &display::Display) {
+    paint_buttons(surf);
+    let (x, y, w, h) = clear_button().rect();
+    disp.update(x, y, w, h, false);
+    let (ux, uy, uw, uh) = undo_button().rect();
+    disp.update(ux, uy, uw, uh, false);
+}
+
+/// The glyphs alone, with no display update, so `--draw-test` can render the
+/// furniture into a PNG on the host and it can actually be looked at.
+fn paint_buttons(surf: &mut Surface) {
     let b = clear_button();
     let (x, y, w, h) = b.rect();
     let inset = fb::s(16);
     // A plain X. Drawn faintly: it is furniture, not one of the diary's marks.
     surf.brush_line(x + inset, y + inset, x + w - inset, y + h - inset, 2, FADED);
     surf.brush_line(x + w - inset, y + inset, x + inset, y + h - inset, 2, FADED);
-    disp.update(x, y, w, h, false);
 
-    // Undo: an arc with a head, drawn the same weight as the X.
+    // Undo: an arc with an arrowhead. The sweep is barely more than half a
+    // turn on purpose — the first version ran 286 degrees, which is close
+    // enough to a closed ring that the head vanished into it and the button
+    // read as "a circle", telling the writer nothing about what it does.
     let u = undo_button();
     let (ux, uy, uw, uh) = u.rect();
-    let (cx, cy) = (ux + uw / 2, uy + uh / 2);
-    let r = (uw.min(uh) / 2 - fb::s(14)) as f32;
+    let (cx, cy) = (ux + uw / 2, uy + uh / 2 + fb::s(6));
+    let r = (uw.min(uh) / 2 - fb::s(16)) as f32;
+    let (a0, a1) = (0.35f32, 3.35f32);
     let mut prev: Option<(i32, i32)> = None;
-    let mut a = -0.6f32;
-    while a < 4.4 {
-        let p = (cx + (r * a.cos()) as i32, cy + (r * a.sin()) as i32);
+    let mut a = a0;
+    while a <= a1 {
+        let p = (cx + (r * a.cos()) as i32, cy - (r * a.sin()) as i32);
         if let Some(q) = prev {
             surf.brush_line(q.0, q.1, p.0, p.1, 2, FADED);
         }
         prev = Some(p);
-        a += 0.12;
+        a += 0.1;
     }
-    let head = (cx + (r * (-0.6f32).cos()) as i32, cy + (r * (-0.6f32).sin()) as i32);
-    surf.brush_line(head.0, head.1, head.0 - fb::s(13), head.1 - fb::s(3), 2, FADED);
-    surf.brush_line(head.0, head.1, head.0 + fb::s(3), head.1 - fb::s(13), 2, FADED);
-    disp.update(ux, uy, uw, uh, false);
+    // Head at the left end, pointing back the way the arc came: two barbs off
+    // the tangent, long enough to read at this size.
+    let tip = (cx + (r * a1.cos()) as i32, cy - (r * a1.sin()) as i32);
+    let barb = fb::s(20) as f32;
+    for off in [-0.7f32, 0.7] {
+        let d = a1 + std::f32::consts::FRAC_PI_2 + off;
+        surf.brush_line(
+            tip.0,
+            tip.1,
+            tip.0 + (barb * d.cos()) as i32,
+            tip.1 - (barb * d.sin()) as i32,
+            2,
+            FADED,
+        );
+    }
 }
 
 fn draw_clear_button(surf: &mut Surface, disp: &display::Display) {
