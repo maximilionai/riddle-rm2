@@ -108,17 +108,49 @@ impl Ink {
     /// Crops to the ink bounding box and box-downscales so the long side stays
     /// ≤ 800px (at least 2x): the model reads handwriting fine at that scale,
     /// and image pixels are the dominant vision-token / latency cost.
-    pub fn to_png(&self, surf: &Surface, path: &str) -> std::io::Result<()> {
-        if self.bbox.is_empty() {
+    ///
+    /// `pad_frac` widens the crop by that fraction of the page on each side,
+    /// on top of the fixed 20px. Pass 0.0 for the reply path (the historical
+    /// behaviour). Annotation mode passes a real fraction: the model can only
+    /// mark INSIDE the image it was sent, so a bbox-tight crop leaves it no
+    /// margin to put a note in.
+    ///
+    /// `also` is unioned into the crop before padding. In annotation mode that
+    /// is the region the diary's own marks occupy: they are drawn on the
+    /// surface but are not the writer's ink, so the bbox does not know about
+    /// them, and a crop that excluded them would hide the model's previous
+    /// turn from it — the shared canvas would silently reset every turn.
+    ///
+    /// Returns the [`PageView`] describing where the image sits on screen —
+    /// without it, coordinates the model returns cannot be mapped back.
+    pub fn to_png(
+        &self,
+        surf: &Surface,
+        path: &str,
+        pad_frac: f32,
+        also: BBox,
+    ) -> std::io::Result<PageView> {
+        let mut area = self.bbox;
+        if !also.is_empty() {
+            area.add(also.x0, also.y0, 0);
+            area.add(also.x1, also.y1, 0);
+        }
+        if area.is_empty() {
             return Err(std::io::Error::other("no ink"));
         }
-        let (bx, by, bw, bh) = self.bbox.rect();
-        let x0 = (bx - 20).max(0) as usize;
-        let y0 = (by - 20).max(0) as usize;
-        let x1 = ((bx + bw + 20) as usize).min(surf.w);
-        let y1 = ((by + bh + 20) as usize).min(surf.h);
+        let (bx, by, bw, bh) = area.rect();
+        let pad_x = 20 + (surf.w as f32 * pad_frac) as i32;
+        let pad_y = 20 + (surf.h as f32 * pad_frac) as i32;
+        let x0 = (bx - pad_x).max(0) as usize;
+        let y0 = (by - pad_y).max(0) as usize;
+        let x1 = ((bx + bw + pad_x) as usize).min(surf.w);
+        let y1 = ((by + bh + pad_y) as usize).min(surf.h);
         let f = ((x1 - x0).max(y1 - y0)).div_ceil(800).max(2);
         let (w, h) = ((x1 - x0) / f, (y1 - y0) / f);
+        if w == 0 || h == 0 {
+            return Err(std::io::Error::other("ink region too small"));
+        }
+        let view = PageView { x0: x0 as i32, y0: y0 as i32, f, w, h };
 
         let mut gray = vec![0u8; w * h];
         for oy in 0..h {
@@ -143,7 +175,59 @@ impl Ink {
         writer
             .write_image_data(&gray)
             .map_err(std::io::Error::other)?;
-        Ok(())
+        Ok(view)
+    }
+}
+
+/// Where the PNG the oracle saw sits on the screen.
+///
+/// `to_png` crops to the ink bbox at offset (`x0`, `y0`) and box-downscales by
+/// `f`, producing a `w` x `h` image. Everything the model says about that image
+/// is in ITS coordinate space, so mapping an answer back to the page needs all
+/// four numbers. Dropping them was the whole reason the model could not point
+/// at anything.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageView {
+    pub x0: i32,
+    pub y0: i32,
+    /// Downscale factor applied to the crop.
+    pub f: usize,
+    /// Image dimensions in pixels, after downscaling.
+    pub w: usize,
+    pub h: usize,
+}
+
+impl PageView {
+    /// Normalized model coordinates (0..=1000 on each axis, independently) to
+    /// screen pixels. `w * f` rather than `x1 - x0`: integer truncation in
+    /// `to_png` means the image covers exactly `w * f` screen pixels, which is
+    /// up to `f - 1` short of the requested crop.
+    pub fn to_screen(&self, u: i32, v: i32) -> (i32, i32) {
+        let span_x = (self.w * self.f) as i64;
+        let span_y = (self.h * self.f) as i64;
+        (
+            self.x0 + (u.clamp(0, 1000) as i64 * span_x / 1000) as i32,
+            self.y0 + (v.clamp(0, 1000) as i64 * span_y / 1000) as i32,
+        )
+    }
+
+    /// Screen pixels back to normalized coordinates. Used to describe the
+    /// writer's own strokes to the model in the same space it answers in.
+    pub fn to_norm(&self, x: i32, y: i32) -> (i32, i32) {
+        let span_x = (self.w * self.f).max(1) as i64;
+        let span_y = (self.h * self.f).max(1) as i64;
+        (
+            (((x - self.x0) as i64 * 1000) / span_x).clamp(0, 1000) as i32,
+            (((y - self.y0) as i64 * 1000) / span_y).clamp(0, 1000) as i32,
+        )
+    }
+
+    /// A normalized length (a circle radius) to screen pixels. Measured
+    /// against the SMALLER axis so a radius means the same thing regardless of
+    /// which way the crop is stretched.
+    pub fn to_screen_len(&self, r: i32) -> i32 {
+        let span = ((self.w * self.f).min(self.h * self.f)) as i64;
+        (r.max(0) as i64 * span / 1000) as i32
     }
 }
 

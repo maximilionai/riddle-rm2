@@ -12,6 +12,7 @@ mod fb;
 mod help;
 mod ink;
 mod memory;
+mod ops;
 mod oracle;
 mod pen;
 mod power;
@@ -56,6 +57,10 @@ usage:
   riddle --oracle-test [PNG]  run one oracle turn against PNG (default
                               /tmp/riddle-page.png) and print the streamed
                               reply; verifies key + endpoint + model
+  riddle --draw-test [OPS]    render annotation ops to /tmp/riddle-draw.png
+                              on the host — no tablet, no key. OPS is a
+                              newline-separated op list, or a file of one,
+                              or omitted for a built-in sample
   riddle --version            print the version
 
 configuration lives in oracle.env next to the binary — see
@@ -156,6 +161,12 @@ fn main() {
             let png = args.get(2).map(String::as_str).unwrap_or(PNG_PATH);
             std::process::exit(oracle_test(png));
         }
+        // Phase 0 of the drawing modality, offline: expand ops to strokes and
+        // stamp them into an off-screen surface. The whole renderer can be
+        // iterated on here — wobble especially — with no device and no API key.
+        Some("--draw-test") => {
+            std::process::exit(draw_test(args.get(2).map(String::as_str)));
+        }
         Some("--version" | "-V") => {
             println!("riddle {}", env!("CARGO_PKG_VERSION"));
             return;
@@ -206,6 +217,15 @@ fn oracle_test(png: &str) -> i32 {
                 println!("[would conjure memory {id} — {}]", memory::spoken_date(id));
                 got.push_str("(show)");
             }
+            Ok(Ok(Event::Draw(marks))) => {
+                // Printed as the model wrote them: --oracle-test is how you
+                // find out whether it can point before involving the tablet.
+                println!("[{} mark(s)]", marks.len());
+                for m in &marks {
+                    println!("  {}", m.to_line());
+                }
+                got.push_str("(draw)");
+            }
             Ok(Ok(Event::Transcript(t))) => eprintln!("\n[transcript] {t}"),
             Ok(Err(e)) => {
                 eprintln!("\noracle error: {e}");
@@ -216,6 +236,107 @@ fn oracle_test(png: &str) -> i32 {
     }
     println!("\n--- reply complete ({}ms, {} chars) ---", t0.elapsed().as_millis(), got.len());
     if got.trim().is_empty() { 1 } else { 0 }
+}
+
+/// One of each op, so a single run exercises every branch of the renderer.
+const DRAW_SAMPLE: &str = "\
+circle 300 250 90
+box 550 180 300 120
+arrow 420 400 640 300
+underline 200 560 700 566
+strike 200 660 700 668
+tick 820 520
+cross 880 620
+note 150 760 \"look here\"
+";
+
+/// Render annotation ops to a PNG on the host — the modality with the tablet,
+/// the network and the model all removed. `spec` is an op list, a path to a
+/// file holding one, or None for [`DRAW_SAMPLE`].
+fn draw_test(spec: Option<&str>) -> i32 {
+    let font = match FontRef::try_from_slice(FONT_TTF) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("riddle: font: {e}");
+            return 1;
+        }
+    };
+    let text = match spec {
+        None => DRAW_SAMPLE.to_string(),
+        // A path if it resolves, otherwise treat the argument itself as ops.
+        Some(s) => std::fs::read_to_string(s).unwrap_or_else(|_| s.to_string()),
+    };
+    let (ops, dropped) = ops::parse_ops(&text);
+    if dropped > 0 {
+        eprintln!("riddle: dropped {dropped} malformed op(s)");
+    }
+    if ops.is_empty() {
+        eprintln!("riddle: no ops to draw");
+        return 1;
+    }
+
+    // The whole page at 1:1 — --draw-test asks what the marks look like, not
+    // where a particular crop would have put them.
+    let view = ink::PageView { x0: 0, y0: 0, f: 1, w: SCREEN_W, h: SCREEN_H };
+    let strokes = ops::ops_to_strokes(&ops, &view, &font);
+
+    let mut buf = vec![0xFFu8; SCREEN_W * SCREEN_H * 4];
+    let ptr = buf.as_mut_ptr();
+    let mut surf = Surface::new(
+        ptr,
+        SCREEN_W * SCREEN_H * 4,
+        SCREEN_W,
+        SCREEN_H,
+        SCREEN_W * 4,
+        surface::PixFmt::Rgb32,
+    );
+    // Exactly what the animator does, with the 14ms pacing taken out.
+    let mut points = 0usize;
+    for s in &strokes {
+        for (i, &(x, y)) in s.iter().enumerate() {
+            if i > 0 {
+                let (px, py) = s[i - 1];
+                surf.brush_line(px, py, x, y, 2, BLACK);
+            } else {
+                surf.stamp(x, y, 2, BLACK);
+            }
+            points += 1;
+        }
+    }
+
+    let mut gray = vec![0u8; SCREEN_W * SCREEN_H];
+    for y in 0..SCREEN_H {
+        for x in 0..SCREEN_W {
+            gray[y * SCREEN_W + x] = surf.luma(x as i32, y as i32);
+        }
+    }
+    let out = std::env::var("RIDDLE_DRAW_OUT").unwrap_or_else(|_| "/tmp/riddle-draw.png".into());
+    let file = match std::fs::File::create(&out) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("riddle: {out}: {e}");
+            return 1;
+        }
+    };
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), SCREEN_W as u32, SCREEN_H as u32);
+    enc.set_color(png::ColorType::Grayscale);
+    enc.set_depth(png::BitDepth::Eight);
+    let wrote = enc
+        .write_header()
+        .and_then(|mut w| w.write_image_data(&gray));
+    if let Err(e) = wrote {
+        eprintln!("riddle: encode: {e}");
+        return 1;
+    }
+    // 26 points per 14ms tick is the animator's budget; this is what the marks
+    // will actually cost on the page.
+    let ms = points as f64 / 26.0 * 14.0;
+    println!(
+        "{} op(s) -> {} stroke(s), {points} point(s) (~{ms:.0}ms to draw)\nwrote {out}",
+        ops.len(),
+        strokes.len()
+    );
+    0
 }
 
 /// What the diary sends alongside the page: its memory of recent turns and
@@ -299,6 +420,22 @@ fn run() -> std::io::Result<()> {
     let mut turn_reply = String::new();
     let mut turn_transcript: Option<String> = None;
     let mut turn_failed = false;
+    // Annotation mode: the diary marks the page instead of writing on it.
+    // Everything below the prompt is shared; what changes is that the writer's
+    // ink is NOT drunk (the marks have to point at something) and the marks are
+    // not faded (the writer answers them on the next turn).
+    let annotating = oracle.as_ref().is_some_and(|o| o.annotating());
+    // Where the diary's own marks currently sit. Not part of `user_ink`, so
+    // without tracking it separately the next crop would cut them off and the
+    // model would lose sight of its own previous turn.
+    let mut marks = BBox::empty();
+    // The crop the model last saw. Every coordinate it returns is in this
+    // space; without it a reply cannot be mapped back onto the page.
+    let mut page_view: Option<ink::PageView> = None;
+    // Layer 1: the marks the diary made this turn, kept as ops rather than
+    // pixels. Handed back to the model next turn so it can refer to its own
+    // previous annotations instead of re-reading them out of the image.
+    let mut turn_ops: Vec<ops::Op> = Vec::new();
     // Raw stylus contact, tracked in every state (the guide dismisses on it).
     // `stylus_on` is the level; `stylus_tapped` latches any contact seen this
     // loop iteration, so a tap that starts AND ends within one drain still
@@ -421,7 +558,14 @@ fn run() -> std::io::Result<()> {
                         *last_pen = Some(Instant::now());
                     }
                     State::Lingering { region, .. } => {
-                        state = State::FadingReply { stage: 0, next: Instant::now(), region };
+                        // Touching the page while marks rest on it means the
+                        // writer is answering them, so in annotation mode this
+                        // is the start of the next turn, not a dismissal.
+                        state = if annotating {
+                            State::Listening { last_pen: Some(Instant::now()) }
+                        } else {
+                            State::FadingReply { stage: 0, next: Instant::now(), region }
+                        };
                     }
                     _ => {}
                 }
@@ -451,7 +595,11 @@ fn run() -> std::io::Result<()> {
                         }
                         *last_pen = Some(Instant::now());
                     } else if let State::Lingering { region, .. } = state {
-                        state = State::FadingReply { stage: 0, next: Instant::now(), region };
+                        state = if annotating {
+                            State::Listening { last_pen: Some(Instant::now()) }
+                        } else {
+                            State::FadingReply { stage: 0, next: Instant::now(), region }
+                        };
                     }
                 }
                 qtfb::INPUT_PEN_RELEASE => {
@@ -503,8 +651,18 @@ fn run() -> std::io::Result<()> {
                         let plan = plan_reply(&font, &oracle_excuse("no oracle"), Some(y));
                         State::Replying { plan, next: Instant::now(), rx: None }
                     } else {
-                        if let Err(e) = user_ink.to_png(&surf, PNG_PATH) {
-                            eprintln!("riddle: rasterize failed: {e}");
+                        // Annotation needs room to annotate INTO: a bbox-tight
+                        // crop leaves the model nowhere to put a margin note,
+                        // because it can only mark inside the image it was
+                        // sent. The reply path keeps the tight crop (0.0), so
+                        // its token cost is unchanged.
+                        let pad = if annotating { 0.15 } else { 0.0 };
+                        match user_ink.to_png(&surf, PNG_PATH, pad, marks) {
+                            Ok(v) => page_view = Some(v),
+                            Err(e) => {
+                                eprintln!("riddle: rasterize failed: {e}");
+                                page_view = None;
+                            }
                         }
                         // Remember this page: strokes now (they're cleared
                         // after the drink), transcript/reply as they stream.
@@ -513,6 +671,7 @@ fn run() -> std::io::Result<()> {
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
                         turn_strokes = user_ink.stroke_list().to_vec();
+                        turn_ops.clear();
                         turn_reply.clear();
                         turn_transcript = None;
                         turn_failed = false;
@@ -528,7 +687,20 @@ fn run() -> std::io::Result<()> {
                             let _ = std::fs::remove_file(PNG_PATH);
                         }
                         let region = user_ink.bbox;
-                        State::Drinking { stage: 0, next: Instant::now(), region, rx }
+                        if annotating {
+                            // Don't drink the ink: the marks are about to point
+                            // at it, and the writer answers them on the page
+                            // they are drawn on. The page is a shared canvas
+                            // from here, so it also never gets cleared for us.
+                            State::Thinking {
+                                rx,
+                                pulse: Instant::now(),
+                                blot_on: false,
+                                since: Instant::now(),
+                            }
+                        } else {
+                            State::Drinking { stage: 0, next: Instant::now(), region, rx }
+                        }
                     }
                 }
                 _ => State::Listening { last_pen },
@@ -570,6 +742,13 @@ fn run() -> std::io::Result<()> {
                                     State::Replying { plan, next: Instant::now(), rx: None }
                                 }
                             }
+                        }
+                        Ok(Event::Draw(ops)) => {
+                            let plan = plan_marks(&font, &ops, page_view.as_ref());
+                            marks.add(plan.region.x0, plan.region.y0, 0);
+                            marks.add(plan.region.x1, plan.region.y1, 0);
+                            turn_ops.extend(ops);
+                            State::Replying { plan, next: Instant::now(), rx: Some(rx) }
                         }
                         Ok(Event::Ink(text)) => {
                             turn_reply.push_str(&text);
@@ -620,6 +799,21 @@ fn run() -> std::io::Result<()> {
                 // new chunk below what is already planned, mid-animation.
                 if let Some(ref r) = rx {
                     let drop_rx = match r.try_recv() {
+                        // Marks can arrive after prose — "I see what you mean,
+                        // ⟦draw …⟧" is the natural shape — so they splice into
+                        // a running animation the same way more text does.
+                        Ok(Ok(Event::Draw(more_ops))) => {
+                            let add = plan_marks(&font, &more_ops, page_view.as_ref());
+                            if !add.strokes.is_empty() {
+                                plan.region.add(add.region.x0, add.region.y0, 0);
+                                plan.region.add(add.region.x1, add.region.y1, 0);
+                                marks.add(add.region.x0, add.region.y0, 0);
+                                marks.add(add.region.x1, add.region.y1, 0);
+                                plan.strokes.extend(add.strokes);
+                                turn_ops.extend(more_ops);
+                            }
+                            false
+                        }
                         Ok(Ok(Event::Ink(more))) => {
                             if plan.next_y > SCREEN_H as i32 - fb::s(200) {
                                 // The page is full: let the rest go unwritten
@@ -705,7 +899,14 @@ fn run() -> std::io::Result<()> {
 
             State::Lingering { until, region } => {
                 if Instant::now() >= until {
-                    State::FadingReply { stage: 0, next: Instant::now(), region }
+                    if annotating {
+                        // The marks stay. Fading them would erase the thing the
+                        // writer is meant to answer, and the shared canvas with
+                        // it — layer 1 has to survive to the next turn.
+                        State::Listening { last_pen: None }
+                    } else {
+                        State::FadingReply { stage: 0, next: Instant::now(), region }
+                    }
                 } else {
                     State::Lingering { until, region }
                 }
@@ -957,6 +1158,40 @@ fn plan_reply(font: &FontRef, text: &str, y_start: Option<i32>) -> WritePlan {
     }
 
     WritePlan { strokes, stroke_i: 0, point_i: 0, region, next_y: y }
+}
+
+/// Turn annotation ops into a write plan. The animator is modality-agnostic —
+/// it walks polylines and has no idea whether they came from text or geometry —
+/// so this is the whole of the second producer.
+///
+/// `view` is the crop the model was answering about. Without it the normalized
+/// coordinates are meaningless, so a missing view yields no marks rather than
+/// marks in the wrong place.
+fn plan_marks(font: &FontRef, marks: &[ops::Op], view: Option<&ink::PageView>) -> WritePlan {
+    let empty = WritePlan {
+        strokes: Vec::new(),
+        stroke_i: 0,
+        point_i: 0,
+        region: BBox::empty(),
+        next_y: 0,
+    };
+    let Some(view) = view else {
+        eprintln!("riddle: marks arrived with no page view; dropping {}", marks.len());
+        return empty;
+    };
+    let strokes = ops::ops_to_strokes(marks, view, font);
+    if strokes.is_empty() {
+        return empty;
+    }
+    let mut region = BBox::empty();
+    let mut lowest = 0;
+    for s in &strokes {
+        for &(x, y) in s {
+            region.add(x, y, 5);
+            lowest = lowest.max(y);
+        }
+    }
+    WritePlan { strokes, stroke_i: 0, point_i: 0, region, next_y: lowest }
 }
 
 /// Splice a streamed continuation chunk into a running write animation.

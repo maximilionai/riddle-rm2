@@ -30,6 +30,19 @@ const PERSONA: &str = "You are the memory of Tom Marvolo Riddle, preserved in th
 /// directive and the transcription postscript the app parses back out.
 const MEMORY_PROTOCOL: &str = "\n\nThe diary keeps memories. With each page you receive a numbered catalog of remembered pages, newest first. A FRESH catalog is sent every turn and the numbers are reassigned each time, so only ever use numbers from the catalog on THIS page — never a number you saw earlier.\n\nIf the writer asks to see, revisit, find, or be shown a past page — \"show me…\", \"find the page about…\", \"what did I write on…\" — your ENTIRE reply must be exactly \u{27e6}show:N\u{27e7} and nothing else (no greeting, no prose, before or after), where N is the catalog number of the best match. If they instead ask what you remember in general, reply in words with a short list of remembered moments and their dates. Otherwise reply normally; the catalog is your memory of past pages — draw on it naturally. The catalog's dates are written in English for your eyes only; when you speak of a remembered page, render its date naturally in the language the writer is using.\n\nAfter EVERY response — prose and \u{27e6}show:N\u{27e7} alike — end with a new line containing \u{2042} followed by a faithful word-for-word transcription of what the writer wrote on THIS page (their words only, one line, no commentary). If illegible, put your best attempt after \u{2042}. Earlier replies in this conversation are shown to you without their \u{2042} lines, but you must still end yours with one.";
 
+/// The other modality's character. Deliberately NOT Tom: the persona above is
+/// forbidden to admit an image exists and perceives only words, which is
+/// exactly wrong for something that must look at the page and point at parts
+/// of it.
+const ANNOTATE_PERSONA: &str = "You are the hand that answers in the margins. Someone has written on the page in front of you; you read it and mark it up the way a good reader does — a ring round the word that matters, an arrow between two things that belong together, a tick, a few words in the margin. You never rewrite the page and never argue with it at length; you point. Mark sparingly: a reader should thank you for the marks, not have to read around them. Any words you write are in the language the writer used.";
+
+/// The op vocabulary, appended to [`ANNOTATE_PERSONA`]. This is the actual
+/// interface to the model: everything the parser in `ops.rs` accepts has to be
+/// spelled out here, and anything it does not accept must not be suggested.
+/// The worked example is load-bearing — models follow a shown block far more
+/// reliably than a described one.
+const DRAW_PROTOCOL: &str = "\n\nYou answer with marks, not with prose. Every mark goes inside ONE block: a line \u{27e6}draw, then one op per line, then a line \u{27e7}. Nothing but ops belongs inside the block. A single short line of prose may come BEFORE the block; nothing comes after it.\n\nCoordinates are whole numbers from 0 to 1000. x runs across the width of the image, y runs down its height, each scaled independently, with 0 0 at the TOP-LEFT corner and 1000 1000 at the bottom-right — whatever the shape of the image.\n\nThese eight ops, exactly these forms:\ncircle cx cy r  — a ring around something, centred at cx cy; r is normalized against the SMALLER of the two axes\nbox x y w h  — a rectangle, top-left corner at x y\narrow x1 y1 x2 y2  — from the first point to the second; the head is drawn at x2 y2\nunderline x1 y1 x2 y2  — a line under a run of words\nstrike x1 y1 x2 y2  — a line through a run of words\ntick x y  — a check mark at that point\ncross x y\nnote x y \"short text\"  — a handful of handwritten words, top-left at x y\n\nFor example:\n\u{27e6}draw\ncircle 420 310 55\narrow 300 560 405 345\nnote 70 640 \"this is the crux\"\n\u{27e7}\n\nKeep it to a handful of marks — three or four, rarely more; a covered page says nothing. Put them on empty paper or around the writing rather than on top of words that must stay readable. Leave out any mark you are not sure where to place.";
+
 /// What a turn carries besides the page image: the diary's memory.
 #[derive(Default, Clone)]
 pub struct TurnContext {
@@ -50,12 +63,14 @@ pub enum Event {
     Show(u64),
     /// The transcription postscript (arrives once, at the end).
     Transcript(String),
+    /// Annotation mode: marks to make ON the page instead of prose.
+    Draw(Vec<crate::ops::Op>),
 }
 
 /// Incremental parser over the model's streamed text: routes the
-/// ⟦show:N⟧ directive, chunks prose into sentences, and splits off the
-/// ⁂-transcription postscript. Fed the RUNNING full text (both backends
-/// accumulate), it emits each event exactly once.
+/// ⟦show:N⟧ directive, extracts ⟦draw …⟧ blocks, chunks prose into sentences,
+/// and splits off the ⁂-transcription postscript. Fed the RUNNING full text
+/// (both backends accumulate), it emits each event exactly once.
 pub struct StreamParser {
     delivered: usize,
     sentinel: Option<usize>,
@@ -68,6 +83,9 @@ pub struct StreamParser {
 const SENTINEL: char = '\u{2042}'; // ⁂
 const SHOW_OPEN: char = '\u{27e6}'; // ⟦
 const SHOW_CLOSE: char = '\u{27e7}'; // ⟧
+const DRAW_TAG: &str = "draw";
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
 
 impl StreamParser {
     pub fn new(catalog_ids: Vec<u64>) -> Self {
@@ -83,8 +101,17 @@ impl StreamParser {
 
     /// Feed the full accumulated reply text so far. `done` marks end of
     /// stream: flushes the tail and the transcription.
-    pub fn advance(&mut self, full: &str, done: bool) -> Vec<Result<Event, String>> {
+    pub fn advance(&mut self, raw: &str, done: bool) -> Vec<Result<Event, String>> {
         let mut out = Vec::new();
+
+        // Chain-of-thought never reaches the page. Groq's vision model thinks
+        // by default with reasoning_format=raw, so the thinking arrives inline
+        // in the ordinary content deltas — and the diary inked it.
+        let visible = strip_think(raw);
+        let full = visible.as_ref();
+        // strip_think can shorten the text (a tag that just opened swallows its
+        // tail); a delivered offset from a longer earlier pass would panic.
+        self.delivered = self.delivered.min(full.len());
 
         if self.sentinel.is_none() {
             self.sentinel = full.find(SENTINEL);
@@ -100,26 +127,30 @@ impl StreamParser {
         // only honored before any prose has streamed.
         if !self.route_checked {
             let lead = full[self.delivered..effective].trim_start();
-            if lead.starts_with(SHOW_OPEN) {
-                let Some(close_rel) = lead.find(SHOW_CLOSE) else {
-                    if !done {
-                        return out; // directive still streaming in
+            if let Some(after) = lead.strip_prefix(SHOW_OPEN) {
+                if draw_body_start(after).is_some() {
+                    // A draw block is allowed to lead too; the block extractor
+                    // below owns it, and it is emphatically not a ⟦show:N⟧.
+                    self.route_checked = true;
+                } else if let Some(close_rel) = lead.find(SHOW_CLOSE) {
+                    let inner = &lead[SHOW_OPEN.len_utf8()..close_rel];
+                    let n: Option<usize> = inner
+                        .to_ascii_lowercase()
+                        .strip_prefix("show")
+                        .map(|r| r.trim_start_matches([':', ' ']))
+                        .and_then(|r| r.trim().parse().ok());
+                    self.route_checked = true;
+                    self.emitted_any = true;
+                    self.delivered = effective; // consume the whole body
+                    match n.and_then(|n| self.catalog_ids.get(n.wrapping_sub(1)).copied()) {
+                        Some(id) => out.push(Ok(Event::Show(id))),
+                        None => out.push(Err(format!("the diary lost that page ({inner})"))),
                     }
+                } else if !done {
+                    return out; // directive still streaming in
+                } else {
                     out.push(Err("unfinished conjuring directive".into()));
                     return out;
-                };
-                let inner = &lead[SHOW_OPEN.len_utf8()..close_rel];
-                let n: Option<usize> = inner
-                    .to_ascii_lowercase()
-                    .strip_prefix("show")
-                    .map(|r| r.trim_start_matches([':', ' ']))
-                    .and_then(|r| r.trim().parse().ok());
-                self.route_checked = true;
-                self.emitted_any = true;
-                self.delivered = effective; // consume the whole body
-                match n.and_then(|n| self.catalog_ids.get(n.wrapping_sub(1)).copied()) {
-                    Some(id) => out.push(Ok(Event::Show(id))),
-                    None => out.push(Err(format!("the diary lost that page ({inner})"))),
                 }
             } else if lead.is_empty() {
                 if !done {
@@ -132,10 +163,28 @@ impl StreamParser {
             }
         }
 
-        // Prose sentences, never crossing into the transcription postscript.
-        // A stray directive that appears AFTER prose (a misbehaving model)
-        // is stripped here so the writer never sees ⟦…⟧ glyphs inked.
-        if self.delivered < effective {
+        // Where prose must stop: a draw block, or a bracket that has not
+        // streamed far enough to rule one out. Unlike ⟦show:N⟧ a draw block may
+        // FOLLOW prose ("I see what you mean, ⟦draw …⟧"), so the prose ahead of
+        // it is inked normally and only the block itself is held.
+        let block = hold_at(&full[self.delivered..effective], done).map(|i| self.delivered + i);
+
+        // Prose sentences, never crossing into the transcription postscript or
+        // into a held block. A stray directive that appears AFTER prose (a
+        // misbehaving model) is stripped here so the writer never sees ⟦…⟧
+        // glyphs inked.
+        if let Some(b) = block {
+            // The prose before a block can no longer grow, so it goes out
+            // whole rather than waiting for a sentence to complete.
+            if self.delivered < b {
+                let chunk = strip_directives(&clean(&full[self.delivered..b]));
+                if !chunk.is_empty() {
+                    self.emitted_any = true;
+                    out.push(Ok(Event::Ink(chunk)));
+                }
+                self.delivered = b;
+            }
+        } else if self.delivered < effective {
             if let Some(cut) = sentence_cut(&full[..effective], self.delivered) {
                 let chunk = strip_directives(&clean(&full[self.delivered..cut]));
                 if !chunk.is_empty() {
@@ -143,6 +192,37 @@ impl StreamParser {
                     out.push(Ok(Event::Ink(chunk)));
                 }
                 self.delivered = cut;
+            }
+        }
+
+        // The block itself. A half-streamed block must never render — there is
+        // no un-drawing a stroke — so an unclosed one holds `delivered` where
+        // it is until the ⟧ lands or the stream ends.
+        if let Some(b) = block {
+            let after = &full[b + SHOW_OPEN.len_utf8()..effective];
+            match draw_body_start(after) {
+                Some(bs) => match after[bs..].find(SHOW_CLOSE) {
+                    Some(rel) => {
+                        let (ops, dropped) = crate::ops::parse_ops(&after[bs..bs + rel]);
+                        if dropped > 0 {
+                            eprintln!("riddle: draw block dropped {dropped} unparseable line(s)");
+                        }
+                        if !ops.is_empty() {
+                            self.emitted_any = true;
+                            out.push(Ok(Event::Draw(ops)));
+                        }
+                        self.delivered =
+                            b + SHOW_OPEN.len_utf8() + bs + rel + SHOW_CLOSE.len_utf8();
+                    }
+                    None if done => {
+                        eprintln!("riddle: dropped an unterminated draw block");
+                        self.delivered = effective;
+                    }
+                    None => return out,
+                },
+                // Still ambiguous ("⟦dr" could become ⟦draw or ⟦show); hold_at
+                // only reports these while the stream is running.
+                None => return out,
             }
         }
 
@@ -187,6 +267,18 @@ impl Oracle {
         } else {
             eprintln!("riddle: oracle = pi (set RIDDLE_OPENAI_KEY for the HTTP backend)");
             Ok(Oracle::Pi(PiOracle::spawn(remember)?))
+        }
+    }
+
+    /// Is this oracle marking up the page rather than replying in prose? The
+    /// diary asks before dissolving the writer's ink: annotations are drawn ON
+    /// what was written, so drinking it first would leave marks around nothing.
+    pub fn annotating(&self) -> bool {
+        match self {
+            Oracle::Http(o) => o.annotate,
+            // pi's prompt path is still diary-only; claiming otherwise would
+            // have main.rs keep the ink for a reply that never marks it.
+            Oracle::Pi(_) => false,
         }
     }
 
@@ -396,6 +488,8 @@ pub struct HttpOracle {
     max_tokens: u32,
     reasoning: Option<String>, // "reasoning_effort" value, e.g. "low"
     remember: bool,
+    /// RIDDLE_MODE=annotate: mark the page up instead of replying as Tom.
+    pub annotate: bool,
 }
 
 impl HttpOracle {
@@ -421,11 +515,13 @@ impl HttpOracle {
         // ("low" ≈ faster first ink), but some providers reject the field on
         // non-reasoning models, so it must stay out of the default request.
         let reasoning = std::env::var("RIDDLE_OPENAI_REASONING").ok();
+        let annotate = std::env::var("RIDDLE_MODE").is_ok_and(|m| m == "annotate");
         eprintln!(
-            "riddle: http oracle base={base} model={model} max_tokens={max_tokens} reasoning={}",
-            reasoning.as_deref().unwrap_or("-")
+            "riddle: http oracle base={base} model={model} max_tokens={max_tokens} reasoning={} mode={}",
+            reasoning.as_deref().unwrap_or("-"),
+            if annotate { "annotate" } else { "diary" }
         );
-        Ok(Self { base, key, model, max_tokens, reasoning, remember })
+        Ok(Self { base, key, model, max_tokens, reasoning, remember, annotate })
     }
 
     pub fn ask(&self, png_path: &str, ctx: &TurnContext, tx: Sender<Result<Event, String>>) {
@@ -444,10 +540,13 @@ impl HttpOracle {
             .map(|r| format!("\"reasoning_effort\":{},", json_quote(r)))
             .unwrap_or_default();
 
-        let system = if self.remember {
-            format!("{PERSONA}{MEMORY_PROTOCOL}")
-        } else {
-            PERSONA.to_string()
+        // Annotation mode drops the memory protocol with the persona: the ⁂
+        // transcription and the catalog belong to a diary that answers in
+        // words, and asking for both modalities at once muddies the op block.
+        let system = match (self.annotate, self.remember) {
+            (true, _) => format!("{ANNOTATE_PERSONA}{DRAW_PROTOCOL}"),
+            (false, true) => format!("{PERSONA}{MEMORY_PROTOCOL}"),
+            (false, false) => PERSONA.to_string(),
         };
         // The diary's conversational memory: recent pages as prior turns.
         let mut history_msgs = String::new();
@@ -598,6 +697,10 @@ fn clean(s: &str) -> String {
 /// Remove any ⟦…⟧ directive spans from inked prose, so a misbehaving model
 /// that emits a directive mid/after prose never renders ⟦…⟧ as literal glyphs
 /// in Tom's hand. (A directive that LEADS the reply is routed earlier.)
+///
+/// This eats an unterminated tail too, which would silently swallow a draw
+/// block still streaming in — `advance` never hands one here: a block is
+/// extracted, and prose is cut at the opening bracket, before this runs.
 fn strip_directives(s: &str) -> String {
     if !s.contains(SHOW_OPEN) {
         return s.to_string();
@@ -616,6 +719,84 @@ fn strip_directives(s: &str) -> String {
     }
     out.push_str(rest);
     out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Byte offset within `rest` (the text just past a ⟦) at which a draw block's
+/// body begins, or None if this bracket does not open one. The tag must be the
+/// whole word — `⟦drawing⟧` is prose someone bracketed, not a block.
+fn draw_body_start(rest: &str) -> Option<usize> {
+    if !rest.get(..DRAW_TAG.len())?.eq_ignore_ascii_case(DRAW_TAG) {
+        return None;
+    }
+    match rest[DRAW_TAG.len()..].chars().next() {
+        None => Some(DRAW_TAG.len()),
+        Some(c) if c.is_whitespace() || c == SHOW_CLOSE => Some(DRAW_TAG.len()),
+        Some(_) => None,
+    }
+}
+
+/// Byte offset of the first ⟦ in `s` at which prose delivery must stop: one
+/// that opens a draw block, or — while the stream is still running — one whose
+/// tag has not arrived in full. `⟦dr` is indistinguishable from `⟦show:` until
+/// the next byte lands, and inking it would consume the block's opening.
+fn hold_at(s: &str, done: bool) -> Option<usize> {
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(SHOW_OPEN) {
+        let at = from + rel;
+        let rest = &s[at + SHOW_OPEN.len_utf8()..];
+        if draw_body_start(rest).is_some() {
+            return Some(at);
+        }
+        if !done && rest.len() < DRAW_TAG.len() && DRAW_TAG.starts_with(&rest.to_ascii_lowercase())
+        {
+            return Some(at);
+        }
+        from = at + SHOW_OPEN.len_utf8();
+    }
+    None
+}
+
+/// Drop `<think>…</think>` spans from the reply text.
+///
+/// Groq's only vision model reasons by default and their default
+/// reasoning_format is "raw", so the chain-of-thought arrives inline in the
+/// ordinary `content` deltas rather than in `reasoning_content` (which
+/// `sse_delta_content` already ignores) — the diary inked pages of it. An OPEN
+/// tag swallows everything after it: the thinking is still streaming, and
+/// there is no un-inking once a sentence is drawn. The trailing-fragment trim
+/// covers the same hazard one byte earlier, while `<thi` is still arriving.
+fn strip_think(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains(THINK_OPEN) {
+        return match partial_open(s) {
+            Some(p) => std::borrow::Cow::Owned(s[..p].to_string()),
+            None => std::borrow::Cow::Borrowed(s),
+        };
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(open) = rest.find(THINK_OPEN) {
+        out.push_str(&rest[..open]);
+        match rest[open..].find(THINK_CLOSE) {
+            Some(close) => rest = &rest[open + close + THINK_CLOSE.len()..],
+            None => {
+                rest = ""; // still thinking: hold everything after the tag
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    if let Some(p) = partial_open(&out) {
+        out.truncate(p);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Offset of a trailing fragment of a `<think>` tag ("<", "<th", …), if any.
+fn partial_open(s: &str) -> Option<usize> {
+    (1..THINK_OPEN.len())
+        .rev()
+        .find(|&n| s.ends_with(&THINK_OPEN[..n]))
+        .map(|n| s.len() - n)
 }
 
 /// End of the LAST complete sentence in `text` after byte offset `from`:
@@ -949,6 +1130,122 @@ mod tests {
         assert_eq!(strip_directives("a \u{27e6}show:1\u{27e7} b"), "a b");
         assert_eq!(strip_directives("plain text"), "plain text");
         assert_eq!(strip_directives("tail \u{27e6}show:2"), "tail");
+    }
+
+    /// The natural annotation reply: a line of prose, then the marks. Unlike
+    /// ⟦show:N⟧ the block is honoured even though prose came first.
+    #[test]
+    fn draw_block_after_prose_emits_ink_then_draw() {
+        use crate::ops::Op;
+        let mut p = StreamParser::new(vec![]);
+        let full = "I see what you mean. \u{27e6}draw\ncircle 400 300 60\ntick 700 500\n\u{27e7}";
+        let ev = drain(p.advance(full, true));
+        assert_eq!(
+            ev,
+            vec![
+                Event::Ink("I see what you mean.".into()),
+                Event::Draw(vec![
+                    Op::Circle { cx: 400, cy: 300, r: 60 },
+                    Op::Tick { x: 700, y: 500 },
+                ]),
+            ]
+        );
+    }
+
+    /// A block may also lead the reply, where the ⟦show:N⟧ router would have
+    /// tried to read "draw" as a catalog number.
+    #[test]
+    fn leading_draw_block_is_not_a_conjuring_directive() {
+        use crate::ops::Op;
+        let mut p = StreamParser::new(vec![900]);
+        let ev = drain(p.advance("\u{27e6}draw\nunderline 100 200 400 200\n\u{27e7}", true));
+        assert_eq!(
+            ev,
+            vec![Event::Draw(vec![Op::Underline { x1: 100, y1: 200, x2: 400, y2: 200 }])]
+        );
+    }
+
+    /// The fiddly one: a block arriving a few bytes at a time must render once,
+    /// whole, and never half. Half a mark cannot be un-drawn.
+    #[test]
+    fn fragmented_draw_block_emits_once_and_never_partial() {
+        use crate::ops::Op;
+        let mut p = StreamParser::new(vec![]);
+        let mut all = Vec::new();
+        // Prose ahead of the block still goes out; the bracket holds the rest.
+        all.extend(drain(p.advance("Yes. \u{27e6}", false)));
+        all.extend(drain(p.advance("Yes. \u{27e6}dr", false)));
+        all.extend(drain(p.advance("Yes. \u{27e6}draw\ncir", false)));
+        all.extend(drain(p.advance("Yes. \u{27e6}draw\ncircle 500 500 100\nbox 10 10", false)));
+        assert_eq!(all, vec![Event::Ink("Yes.".into())], "a partial block leaked");
+        let full = "Yes. \u{27e6}draw\ncircle 500 500 100\nbox 10 10 200 100\n\u{27e7}";
+        all.extend(drain(p.advance(full, false)));
+        // Repeated feeds of the settled text must not draw it twice.
+        all.extend(drain(p.advance(full, true)));
+        assert_eq!(
+            all,
+            vec![
+                Event::Ink("Yes.".into()),
+                Event::Draw(vec![
+                    Op::Circle { cx: 500, cy: 500, r: 100 },
+                    Op::Box { x: 10, y: 10, w: 200, h: 100 },
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn unterminated_draw_block_is_dropped_at_done() {
+        let mut p = StreamParser::new(vec![]);
+        assert!(p.advance("Here. \u{27e6}draw\ncircle 500 500 100", false).len() == 1);
+        let ev = p.advance("Here. \u{27e6}draw\ncircle 500 500 100", true);
+        // The prose already went out; the block is gone, not half-drawn.
+        assert!(ev.is_empty(), "{ev:?}");
+    }
+
+    #[test]
+    fn malformed_lines_do_not_cost_the_good_ops() {
+        use crate::ops::Op;
+        let mut p = StreamParser::new(vec![]);
+        let full = "\u{27e6}draw\nswirl 1 2\ncircle 400 300 60\narrow 10 20\n\u{27e7}";
+        let ev = drain(p.advance(full, true));
+        assert_eq!(ev, vec![Event::Draw(vec![Op::Circle { cx: 400, cy: 300, r: 60 }])]);
+    }
+
+    #[test]
+    fn draw_block_with_no_usable_ops_emits_nothing() {
+        let mut p = StreamParser::new(vec![]);
+        let ev = p.advance("Nothing to mark. \u{27e6}draw\n\u{27e7}", true);
+        assert_eq!(drain(ev), vec![Event::Ink("Nothing to mark.".into())]);
+    }
+
+    #[test]
+    fn think_span_is_never_inked() {
+        // Groq's vision model with reasoning_format=raw puts the whole chain of
+        // thought in the content deltas.
+        let mut p = StreamParser::new(vec![]);
+        let full = "<think>The writer asks about rain. I should be brief.</think>The ink blurred.";
+        let ev = drain(p.advance(full, true));
+        assert_eq!(ev, vec![Event::Ink("The ink blurred.".into())]);
+    }
+
+    #[test]
+    fn open_think_tag_holds_everything_after_it() {
+        let mut p = StreamParser::new(vec![]);
+        // Mid-thought: nothing has been decided yet, so nothing is inked.
+        assert!(p.advance("<thi", false).is_empty());
+        assert!(p.advance("<think>She writes of rain. Perhaps.", false).is_empty());
+        let ev = drain(p.advance("<think>She writes of rain. Perhaps.</think>Rain again?", true));
+        assert_eq!(ev, vec![Event::Ink("Rain again?".into())]);
+    }
+
+    #[test]
+    fn think_tag_after_prose_does_not_swallow_the_prose() {
+        let mut p = StreamParser::new(vec![]);
+        let ev = drain(p.advance("Good evening. <think>now what</think> Who writes?", true));
+        let Some(Event::Ink(s)) = ev.first() else { panic!("{ev:?}") };
+        assert!(s.starts_with("Good evening.") && s.ends_with("Who writes?"), "{s}");
+        assert!(!s.contains("now what") && !s.contains("think"), "{s}");
     }
 
     #[test]

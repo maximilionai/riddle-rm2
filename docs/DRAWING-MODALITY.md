@@ -1,6 +1,8 @@
 # Plan — a drawing modality: the model annotates the page back
 
-**Status: design only. No code written.** This is a pick-up-and-build plan.
+**Status: phases 0-3 built and measured.** See *Results* at the bottom for what
+survived contact with a real model, and what the plan got wrong. The design
+below is unchanged from the original except where *Results* says otherwise.
 
 The idea: instead of the model replying only in handwriting, let it *mark the
 page* — circle a word, arrow from one thing to another, tick a line, write a
@@ -220,3 +222,87 @@ needs a different input representation — most likely sending the user's
 strokes as *vector coordinates in the prompt* alongside the image, so the model
 can reference stroke indices instead of guessing pixel positions. That is a
 bigger change, but it is the fallback worth knowing about early.
+
+---
+
+# Results
+
+Phases 0-3 are built. 55 tests pass on the host (`scripts/test-host.sh`, no
+tablet, no key) and the armv7 cross-build is clean.
+
+## Grounding is better than the plan budgeted for — with one correction
+
+Measured with `scripts/probe-grounding.py` against Cerebras `gemma-4-31b`, on a
+synthetic page whose word boxes are known exactly (rendered by `--draw-test`
+from `note` ops, ground truth recovered from the ink bitmap).
+
+| what was asked for | mean error | inside the target box |
+|---|---|---|
+| a whole line | 0.8% | 5/5 |
+| a single word | 0.5 - 2.2% | 4/15 |
+
+Line-level pointing is comfortably inside the ±2-3% budget. Word-level looked
+marginal until the errors turned out not to be noise:
+
+**x lands within 0.5% everywhere. y comes back systematically LONG** — ~0% error
+at the top of the page, growing to ~2% at the bottom. That is a scale factor,
+not imprecision. Fitting 18 samples gives **k = 1.025**, and dividing every
+returned y by it moves all six word-level targets from outside their box to
+inside. Latency was ~0.5s per call, so the plan's "latency is all TTFT" holds.
+
+This is now `RIDDLE_GROUND_Y_SCALE`, defaulting to 1.0. It is deliberately NOT
+on by default: it is fitted to one model on one synthetic page. Re-measure per
+model — Groq's qwen will differ — and on real handwriting before trusting it.
+
+The plan's kill criterion (worse than ~5%) is not met. The modality is viable.
+
+## What the plan got wrong
+
+**The ink is drunk before the reply.** The plan says "both parties draw on the
+same surface" but never notices that `Drinking` dissolves the writer's ink and
+`FadingReply` fades the answer. Marks would have pointed at a blank page. In
+annotation mode both are now skipped, which makes the page a genuine shared
+canvas — and means it never clears itself. That is unresolved; see below.
+
+**The crop hides the diary's own marks.** `to_png` crops to the ink bbox, and
+the marks are not the writer's ink, so the next turn's crop would cut them off
+and the model would lose sight of its own previous turn. `to_png` now takes an
+extra region to union in.
+
+**Phase 3's advice would have inked the reasoning.** The plan says to turn
+thinking on and names Qwen 3.6 27B. On Groq — the only place that model is
+served — it thinks by default and `reasoning_format` is `raw`, so the
+chain-of-thought arrives in the ordinary content deltas and the quill draws it.
+Cerebras `gemma-4-31b` is the default instead; a `<think>` stripper makes Groq
+survivable if the A/B is worth running.
+
+**`memory.rs` needs no schema change.** Strokes already go to a per-page sidecar
+with the index kept separate, so layer 1 can be an `<id>.ops` sidecar. Decision
+3 does not block anything.
+
+## Known-wrong, deliberately left
+
+- **The eraser diverges from the op list.** `erase_point` whitens pixels and
+  drops points from the writer's strokes only. Erasing across a mark removes the
+  pixels while the op stays live in layer 1 — display and state disagree. Needs
+  ownership-aware hit-testing, or a rule that the eraser cannot touch AI marks.
+- **The page never clears.** No New Page / Clear gesture in annotation mode.
+- **Layer 1 is collected but not yet fed back.** `turn_ops` accumulates and is
+  not yet persisted or sent to the model, so phase 4-5 (a model that can refer
+  to "the second box") is not done. This is the next thing to build.
+- **No cap on marks per turn.** A dense reply is ~2s of animation.
+
+## The second opinion worth acting on
+
+A review of the design (codex, high effort) agreed the op vocabulary beats SVG
+and that independent 0-1000 axes are correct, but argued the ops should not
+also be the state model: it wants stable IDs per mark, `update`/`remove` as well
+as `add`, and an authoritative scene graph that the composite is rendered FROM.
+That is the right shape for the multi-turn canvas and is what the eraser
+divergence above is really a symptom of. Deferred as an optimisation, not
+rejected.
+
+It also flagged that `circle cx cy r` is the wrong primitive — VLMs are trained
+to emit boxes, so `encircle x1 y1 x2 y2` should ground better and the renderer
+can inscribe the ellipse. Untested; worth an A/B with the probe, and cheap,
+because the probe measures exactly this.
