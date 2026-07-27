@@ -514,7 +514,13 @@ impl HttpOracle {
         // Sent as "reasoning_effort" only when set: reasoning models accept it
         // ("low" ≈ faster first ink), but some providers reject the field on
         // non-reasoning models, so it must stay out of the default request.
-        let reasoning = std::env::var("RIDDLE_OPENAI_REASONING").ok();
+        // Empty means "don't send the field", not "send an empty one". Set but
+        // blank is the documented way to say off (settings.schema.json offers
+        // "" as a choice, and the Cerebras example uses it), and sending
+        // "reasoning_effort":"" earns a 400 from Cerebras — verified on device.
+        let reasoning = std::env::var("RIDDLE_OPENAI_REASONING")
+            .ok()
+            .filter(|r| !r.trim().is_empty());
         let annotate = std::env::var("RIDDLE_MODE").is_ok_and(|m| m == "annotate");
         eprintln!(
             "riddle: http oracle base={base} model={model} max_tokens={max_tokens} reasoning={} mode={}",
