@@ -278,7 +278,7 @@ fn draw_test(spec: Option<&str>) -> i32 {
     // The whole page at 1:1 — --draw-test asks what the marks look like, not
     // where a particular crop would have put them.
     let view = ink::PageView { x0: 0, y0: 0, f: 1, w: SCREEN_W, h: SCREEN_H };
-    let strokes = ops::ops_to_strokes(&ops, &view, &font);
+    let strokes = ops::ops_to_strokes(&ops, &view, &font, None);
 
     let mut buf = vec![0xFFu8; SCREEN_W * SCREEN_H * 4];
     let ptr = buf.as_mut_ptr();
@@ -479,6 +479,9 @@ fn run() -> std::io::Result<()> {
         Duration::from_millis(ms)
     };
 
+    if annotating {
+        draw_clear_button(&mut surf, &disp);
+    }
     eprintln!("riddle: the diary is open");
 
     loop {
@@ -560,6 +563,21 @@ fn run() -> std::io::Result<()> {
                 }
                 match state {
                     State::Listening { ref mut last_pen } => {
+                        // The clear button is checked before any ink is laid
+                        // down, so tapping it never leaves a stroke behind.
+                        if annotating && !clear_button().is_empty() && {
+                            let b = clear_button();
+                            s.x >= b.x0 && s.x <= b.x1 && s.y >= b.y0 && s.y <= b.y1
+                        } {
+                            clear_page(&mut surf, &disp);
+                            user_ink.clear();
+                            marks = BBox::empty();
+                            page_ops.clear();
+                            page_view = None;
+                            *last_pen = None;
+                            eprintln!("riddle: page cleared");
+                            continue;
+                        }
                         pen_down = true;
                         let d = match s.tool {
                             pen::Tool::Pen => {
@@ -760,7 +778,7 @@ fn run() -> std::io::Result<()> {
                             }
                         }
                         Ok(Event::Draw(ops)) => {
-                            let plan = plan_marks(&font, &ops, page_view.as_ref());
+                            let plan = plan_marks(&font, &ops, page_view.as_ref(), &surf);
                             marks.add(plan.region.x0, plan.region.y0, 0);
                             marks.add(plan.region.x1, plan.region.y1, 0);
                             if let Some(v) = page_view {
@@ -832,7 +850,7 @@ fn run() -> std::io::Result<()> {
                         // ⟦draw …⟧" is the natural shape — so they splice into
                         // a running animation the same way more text does.
                         Ok(Ok(Event::Draw(more_ops))) => {
-                            let add = plan_marks(&font, &more_ops, page_view.as_ref());
+                            let add = plan_marks(&font, &more_ops, page_view.as_ref(), &surf);
                             if !add.strokes.is_empty() {
                                 plan.region.add(add.region.x0, add.region.y0, 0);
                                 plan.region.add(add.region.x1, add.region.y1, 0);
@@ -1196,6 +1214,43 @@ fn plan_reply(font: &FontRef, text: &str, y_start: Option<i32>) -> WritePlan {
     WritePlan { strokes, stroke_i: 0, point_i: 0, region, next_y: y }
 }
 
+/// Half-size of the clear button's touch target, top-right of the page.
+const CLEAR_BTN: i32 = fb::s(52);
+
+/// Where the clear button sits. Annotation mode is a shared canvas: the ink is
+/// never drunk and the marks never fade, so without this the page only ever
+/// accumulates — and a page crowded with old marks is also the page the model
+/// has to read.
+fn clear_button() -> BBox {
+    let cx = SCREEN_W as i32 - CLEAR_BTN - fb::s(30);
+    let cy = CLEAR_BTN + fb::s(30);
+    let mut b = BBox::empty();
+    b.add(cx - CLEAR_BTN, cy - CLEAR_BTN, 0);
+    b.add(cx + CLEAR_BTN, cy + CLEAR_BTN, 0);
+    b
+}
+
+fn draw_clear_button(surf: &mut Surface, disp: &display::Display) {
+    let b = clear_button();
+    let (x, y, w, h) = b.rect();
+    let inset = fb::s(16);
+    // A plain X. Drawn faintly: it is furniture, not one of the diary's marks.
+    surf.brush_line(x + inset, y + inset, x + w - inset, y + h - inset, 2, FADED);
+    surf.brush_line(x + w - inset, y + inset, x + inset, y + h - inset, 2, FADED);
+    disp.update(x, y, w, h, false);
+}
+
+/// Wipe the page back to blank paper and forget both layers.
+///
+/// A full (non-flashing) update, not a partial one: annotation mode leaves
+/// marks on e-ink for many turns, and partial updates leave ghosts behind that
+/// a partial clear would preserve.
+fn clear_page(surf: &mut Surface, disp: &display::Display) {
+    surf.fill_rect(0, 0, SCREEN_W, SCREEN_H, WHITE);
+    draw_clear_button(surf, disp);
+    disp.update(0, 0, SCREEN_W as i32, SCREEN_H as i32, false);
+}
+
 /// Turn annotation ops into a write plan. The animator is modality-agnostic —
 /// it walks polylines and has no idea whether they came from text or geometry —
 /// so this is the whole of the second producer.
@@ -1203,7 +1258,12 @@ fn plan_reply(font: &FontRef, text: &str, y_start: Option<i32>) -> WritePlan {
 /// `view` is the crop the model was answering about. Without it the normalized
 /// coordinates are meaningless, so a missing view yields no marks rather than
 /// marks in the wrong place.
-fn plan_marks(font: &FontRef, marks: &[ops::Op], view: Option<&ink::PageView>) -> WritePlan {
+fn plan_marks(
+    font: &FontRef,
+    marks: &[ops::Op],
+    view: Option<&ink::PageView>,
+    page: &Surface,
+) -> WritePlan {
     let empty = WritePlan {
         strokes: Vec::new(),
         stroke_i: 0,
@@ -1215,7 +1275,7 @@ fn plan_marks(font: &FontRef, marks: &[ops::Op], view: Option<&ink::PageView>) -
         eprintln!("riddle: marks arrived with no page view; dropping {}", marks.len());
         return empty;
     };
-    let strokes = ops::ops_to_strokes(marks, view, font);
+    let strokes = ops::ops_to_strokes(marks, view, font, Some(page));
     if strokes.is_empty() {
         return empty;
     }

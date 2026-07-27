@@ -15,8 +15,9 @@
 
 use ab_glyph::FontRef;
 
-use crate::fb::{self, SCREEN_H, SCREEN_W};
+use crate::fb::{self, BBox, SCREEN_H, SCREEN_W};
 use crate::ink::PageView;
+use crate::surface::Surface;
 use crate::script;
 
 /// One mark. Eight primitives, each expanding analytically to a polyline.
@@ -252,7 +253,12 @@ fn calibrated(op: &Op) -> Op {
 /// The output goes straight into `WritePlan.strokes`, so this is the entire
 /// rendering job for the modality: the animator, surface, display driver and
 /// e-ink update path are all untouched.
-pub fn ops_to_strokes(ops: &[Op], view: &PageView, font: &FontRef) -> Vec<Vec<(i32, i32)>> {
+pub fn ops_to_strokes(
+    ops: &[Op],
+    view: &PageView,
+    font: &FontRef,
+    page: Option<&Surface>,
+) -> Vec<Vec<(i32, i32)>> {
     // Correct the model's coordinate bias before any geometry is built, so the
     // wobble seed (hashed from the op's text) still keys off what the model
     // actually said and a given mark keeps rendering identically.
@@ -321,9 +327,25 @@ pub fn ops_to_strokes(ops: &[Op], view: &PageView, font: &FontRef) -> Vec<Vec<(i
                 emit(&mut out, polyline(&[(x + h, y - h), (x - h, y + h)], &mut Hand::new(seed ^ 0x5bf0_3635)));
             }
             Op::Note { x, y, text } => {
+                // The model cannot know how large its own note renders, so
+                // "put it on empty paper" is not a promise it can keep — it
+                // wrote over the page's own words. Placement is settled here,
+                // against the pixels, by sliding the note off whatever it
+                // would have covered.
                 let anchor = view.to_screen(*x, *y);
-                for s in note(font, text, anchor, seed) {
-                    emit(&mut out, s);
+                let strokes = note(font, text, anchor, seed);
+                match page.map(|p| clear_of_ink(p, &strokes)) {
+                    Some(None) => eprintln!("riddle: no clear space for note {text:?}; dropped"),
+                    Some(Some((dx, dy))) => {
+                        for st in strokes {
+                            emit(&mut out, st.iter().map(|&(a, b)| (a + dx, b + dy)).collect());
+                        }
+                    }
+                    None => {
+                        for st in strokes {
+                            emit(&mut out, st);
+                        }
+                    }
                 }
             }
         }
@@ -347,6 +369,56 @@ const NOTE_PX: f32 = 54.0 * SCREEN_W as f32 / fb::REF_W as f32;
 
 /// Keep a note off the panel edge; `to_screen` can put an anchor anywhere.
 const NOTE_MARGIN: i32 = fb::s(36);
+
+/// Find an offset that puts `strokes` on empty paper, or None if the page has
+/// no room. Tries where the model asked first, then slides downward, then
+/// upward — a note belongs near what it refers to, so the search is local
+/// rather than "anywhere free".
+fn clear_of_ink(page: &Surface, strokes: &[Vec<(i32, i32)>]) -> Option<(i32, i32)> {
+    let mut bb = BBox::empty();
+    for st in strokes {
+        for &(x, y) in st {
+            bb.add(x, y, 2);
+        }
+    }
+    if bb.is_empty() {
+        return Some((0, 0));
+    }
+    let step = fb::s(26);
+    let mut offsets = vec![0];
+    for k in 1..=14 {
+        offsets.push(k * step);
+        offsets.push(-k * step);
+    }
+    for dy in offsets {
+        let (y0, y1) = (bb.y0 + dy, bb.y1 + dy);
+        if y0 < NOTE_MARGIN || y1 >= SCREEN_H as i32 - NOTE_MARGIN {
+            continue;
+        }
+        if is_blank(page, bb.x0, y0, bb.x1, y1) {
+            return Some((0, dy));
+        }
+    }
+    None
+}
+
+/// Is this rectangle free of ink? Sampled rather than exhaustive: a note-sized
+/// box is tens of thousands of pixels and this runs per note, per turn.
+fn is_blank(page: &Surface, x0: i32, y0: i32, x1: i32, y1: i32) -> bool {
+    let pad = fb::s(10);
+    let mut y = y0 - pad;
+    while y <= y1 + pad {
+        let mut x = x0 - pad;
+        while x <= x1 + pad {
+            if page.luma(x, y) < 200 {
+                return false;
+            }
+            x += 3;
+        }
+        y += 3;
+    }
+    true
+}
 
 fn emit(out: &mut Vec<Vec<(i32, i32)>>, stroke: Vec<(i32, i32)>) {
     // A one-point "stroke" is a dot the animator would stamp in a spot the
@@ -696,7 +768,7 @@ mod tests {
         let (cx, cy) = v.to_screen(500, 500);
         let r = v.to_screen_len(120);
         assert!(r > 50, "test view should give a visible radius, got {r}");
-        let strokes = ops_to_strokes(&[Op::Circle { cx: 500, cy: 500, r: 120 }], &v, &font());
+        let strokes = ops_to_strokes(&[Op::Circle { cx: 500, cy: 500, r: 120 }], &v, &font(), None);
         assert_eq!(strokes.len(), 1);
         let pts = &strokes[0];
         assert!(pts.len() > 100, "circle should be densely sampled, got {}", pts.len());
@@ -721,7 +793,7 @@ mod tests {
     #[test]
     fn arrow_is_a_shaft_and_two_barbs() {
         let v = view();
-        let strokes = ops_to_strokes(&[Op::Arrow { x1: 100, y1: 100, x2: 700, y2: 600 }], &v, &font());
+        let strokes = ops_to_strokes(&[Op::Arrow { x1: 100, y1: 100, x2: 700, y2: 600 }], &v, &font(), None);
         assert_eq!(strokes.len(), 3, "shaft + two head barbs");
         let head = v.to_screen(700, 600);
         // Both barbs start at the head, and neither is longer than the shaft.
@@ -752,10 +824,10 @@ mod tests {
             Op::Cross { x: 900, y: 400 },
             Op::Note { x: 200, y: 900, text: "hm".into() },
         ];
-        assert_eq!(ops_to_strokes(&ops, &v, &f), ops_to_strokes(&ops, &v, &f));
+        assert_eq!(ops_to_strokes(&ops, &v, &f, None), ops_to_strokes(&ops, &v, &f, None));
         // ...and two identical shapes in different places do not share a tremor.
-        let a = ops_to_strokes(&[Op::Circle { cx: 300, cy: 300, r: 90 }], &v, &f);
-        let b = ops_to_strokes(&[Op::Circle { cx: 600, cy: 300, r: 90 }], &v, &f);
+        let a = ops_to_strokes(&[Op::Circle { cx: 300, cy: 300, r: 90 }], &v, &f, None);
+        let b = ops_to_strokes(&[Op::Circle { cx: 600, cy: 300, r: 90 }], &v, &f, None);
         let shifted: Vec<Vec<(i32, i32)>> = b
             .iter()
             .map(|s| s.iter().map(|&(x, y)| (x - (v.to_screen(600, 0).0 - v.to_screen(300, 0).0), y)).collect())
@@ -777,7 +849,7 @@ mod tests {
             Op::Cross { x: 0, y: 0 },
             Op::Note { x: 990, y: 990, text: "a note pushed off the edge".into() },
         ];
-        let strokes = ops_to_strokes(&ops, &v, &f);
+        let strokes = ops_to_strokes(&ops, &v, &f, None);
         assert!(!strokes.is_empty());
         for s in &strokes {
             assert!(s.len() >= 2, "degenerate stroke of {} points", s.len());
@@ -793,7 +865,7 @@ mod tests {
     #[test]
     fn note_writes_handwriting() {
         let v = view();
-        let strokes = ops_to_strokes(&[Op::Note { x: 100, y: 100, text: "curious".into() }], &v, &font());
+        let strokes = ops_to_strokes(&[Op::Note { x: 100, y: 100, text: "curious".into() }], &v, &font(), None);
         let total: usize = strokes.iter().map(|s| s.len()).sum();
         assert!(strokes.len() > 3 && total > 200, "{} strokes, {total} points", strokes.len());
         let (ax, ay) = v.to_screen(100, 100);
@@ -809,7 +881,7 @@ mod tests {
         // The whole illusion: error correlated between adjacent points, not
         // white noise. Without the drift term the marks read as clip-art.
         let v = view();
-        let strokes = ops_to_strokes(&[Op::Underline { x1: 100, y1: 500, x2: 800, y2: 500 }], &v, &font());
+        let strokes = ops_to_strokes(&[Op::Underline { x1: 100, y1: 500, x2: 800, y2: 500 }], &v, &font(), None);
         assert_eq!(strokes.len(), 1);
         let pts = &strokes[0];
         let base = pts[0].1 as f32;
@@ -831,7 +903,7 @@ mod tests {
             Op::Underline { x1: 500, y1: 500, x2: 500, y2: 500 },
             Op::Arrow { x1: 500, y1: 500, x2: 500, y2: 500 },
         ] {
-            for s in ops_to_strokes(std::slice::from_ref(&op), &v, &f) {
+            for s in ops_to_strokes(std::slice::from_ref(&op), &v, &f, None) {
                 assert!(s.len() >= 2, "{op:?} emitted a {}-point stroke", s.len());
             }
         }
