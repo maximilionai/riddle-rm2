@@ -128,6 +128,66 @@ fn num(tok: &str) -> Option<i32> {
     (0..=1000).contains(&v).then_some(v)
 }
 
+/// Re-express an op authored against one crop in another crop's coordinates.
+///
+/// The image sent each turn is a MOVING window: the crop grows as the writer
+/// fills the page, so a mark recorded as `500 500` on turn 2 is somewhere else
+/// entirely in turn 5's normalized space. Handing the model back the raw
+/// numbers would describe marks that are not where the image shows them —
+/// worse than saying nothing, because it contradicts what it can see.
+///
+/// Screen space is the stable frame, so the map is old → screen → new.
+pub fn reproject(op: &Op, from: &PageView, to: &PageView) -> Op {
+    let p = |x: &i32, y: &i32| {
+        let (sx, sy) = from.to_screen(*x, *y);
+        to.to_norm(sx, sy)
+    };
+    // Lengths scale with the ratio of the two crops' spans, on the axis each
+    // length is measured against.
+    let span_min = |v: &PageView| (v.w * v.f).min(v.h * v.f).max(1) as f32;
+    let k_min = span_min(from) / span_min(to);
+    let kx = (from.w * from.f).max(1) as f32 / (to.w * to.f).max(1) as f32;
+    let ky = (from.h * from.f).max(1) as f32 / (to.h * to.f).max(1) as f32;
+    let scale = |v: &i32, k: f32| ((*v as f32 * k).round() as i32).clamp(0, 1000);
+    match op {
+        Op::Circle { cx, cy, r } => {
+            let (x, y) = p(cx, cy);
+            Op::Circle { cx: x, cy: y, r: scale(r, k_min) }
+        }
+        Op::Box { x, y, w, h } => {
+            let (a, b) = p(x, y);
+            Op::Box { x: a, y: b, w: scale(w, kx), h: scale(h, ky) }
+        }
+        Op::Arrow { x1, y1, x2, y2 } => {
+            let (a, b) = p(x1, y1);
+            let (c, d) = p(x2, y2);
+            Op::Arrow { x1: a, y1: b, x2: c, y2: d }
+        }
+        Op::Underline { x1, y1, x2, y2 } => {
+            let (a, b) = p(x1, y1);
+            let (c, d) = p(x2, y2);
+            Op::Underline { x1: a, y1: b, x2: c, y2: d }
+        }
+        Op::Strike { x1, y1, x2, y2 } => {
+            let (a, b) = p(x1, y1);
+            let (c, d) = p(x2, y2);
+            Op::Strike { x1: a, y1: b, x2: c, y2: d }
+        }
+        Op::Tick { x, y } => {
+            let (a, b) = p(x, y);
+            Op::Tick { x: a, y: b }
+        }
+        Op::Cross { x, y } => {
+            let (a, b) = p(x, y);
+            Op::Cross { x: a, y: b }
+        }
+        Op::Note { x, y, text } => {
+            let (a, b) = p(x, y);
+            Op::Note { x: a, y: b, text: text.clone() }
+        }
+    }
+}
+
 /// Per-model correction for the vertical scale the model actually answers in.
 ///
 /// Measured against gemma-4-31b on a synthetic page with known word boxes

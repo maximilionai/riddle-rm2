@@ -34,14 +34,14 @@ const MEMORY_PROTOCOL: &str = "\n\nThe diary keeps memories. With each page you 
 /// forbidden to admit an image exists and perceives only words, which is
 /// exactly wrong for something that must look at the page and point at parts
 /// of it.
-const ANNOTATE_PERSONA: &str = "You are the hand that answers in the margins. Someone has written on the page in front of you; you read it and mark it up the way a good reader does — a ring round the word that matters, an arrow between two things that belong together, a tick, a few words in the margin. You never rewrite the page and never argue with it at length; you point. Mark sparingly: a reader should thank you for the marks, not have to read around them. Any words you write are in the language the writer used.";
+const ANNOTATE_PERSONA: &str = "You are the hand that answers in the margins. Someone writes on the page in front of you; you read what they wrote and mark it up the way an attentive reader does. You do not rewrite the page and you do not lecture — you point at what they wrote and respond to it.\n\nEach turn, do ONE or TWO of these, and nothing else:\n- ring the single word or short phrase that carries the most weight in what they just wrote\n- underline a phrase worth keeping\n- tick something you agree with, or cross something that does not follow\n- draw an arrow between two things on the page that belong together\n- write a SHORT note in the empty margin — a question back, or a few words that answer them\n\nAnswer the writer's NEWEST words, the ones nearest the bottom or the ones not yet marked. Mark sparingly: a reader should thank you for the marks, not read around them. Any words you write are in the language the writer used.";
 
 /// The op vocabulary, appended to [`ANNOTATE_PERSONA`]. This is the actual
 /// interface to the model: everything the parser in `ops.rs` accepts has to be
 /// spelled out here, and anything it does not accept must not be suggested.
 /// The worked example is load-bearing — models follow a shown block far more
 /// reliably than a described one.
-const DRAW_PROTOCOL: &str = "\n\nYou answer with marks, not with prose. Every mark goes inside ONE block: a line \u{27e6}draw, then one op per line, then a line \u{27e7}. Nothing but ops belongs inside the block. A single short line of prose may come BEFORE the block; nothing comes after it.\n\nCoordinates are whole numbers from 0 to 1000. x runs across the width of the image, y runs down its height, each scaled independently, with 0 0 at the TOP-LEFT corner and 1000 1000 at the bottom-right — whatever the shape of the image.\n\nThese eight ops, exactly these forms:\ncircle cx cy r  — a ring around something, centred at cx cy; r is normalized against the SMALLER of the two axes\nbox x y w h  — a rectangle, top-left corner at x y\narrow x1 y1 x2 y2  — from the first point to the second; the head is drawn at x2 y2\nunderline x1 y1 x2 y2  — a line under a run of words\nstrike x1 y1 x2 y2  — a line through a run of words\ntick x y  — a check mark at that point\ncross x y\nnote x y \"short text\"  — a handful of handwritten words, top-left at x y\n\nFor example:\n\u{27e6}draw\ncircle 420 310 55\narrow 300 560 405 345\nnote 70 640 \"this is the crux\"\n\u{27e7}\n\nKeep it to a handful of marks — three or four, rarely more; a covered page says nothing. Put them on empty paper or around the writing rather than on top of words that must stay readable. Leave out any mark you are not sure where to place.";
+const DRAW_PROTOCOL: &str = "\n\nYou answer with marks, not with prose. Every mark goes inside ONE block: a line \u{27e6}draw, then the lines below, then a line \u{27e7}. Write NO prose at all, before or after the block — the page has no place to put a sentence, and any words you want the writer to read must be a note op so they land somewhere you chose.\n\nCoordinates are whole numbers from 0 to 1000. x runs across the width of the image, y runs down its height, each scaled independently, with 0 0 at the TOP-LEFT corner and 1000 1000 at the bottom-right — whatever the shape of the image.\n\nBEFORE EVERY OP, write a line starting with # naming the exact words on the page that the mark is for, and where they sit. Find those words in the image FIRST, then give the coordinates of those words. This is not optional and it is the difference between a mark that lands and a mark that does not:\n# the words \"kept rising\", third line, left half\ncircle 210 430 60\n\nNEVER put a mark near 500 500 unless the thing you are marking is genuinely at the middle of the image. The centre of the page is not a default. If you cannot find the thing you meant to mark, leave that op out. An empty \u{27e6}draw \u{27e7} block is a perfectly good answer; a mark in the wrong place is not.\n\nThese eight ops, exactly these forms:\ncircle cx cy r  — a ring around something, centred at cx cy; r is normalized against the SMALLER of the two axes\nbox x y w h  — a rectangle, top-left corner at x y\narrow x1 y1 x2 y2  — from the first point to the second; the head is drawn at x2 y2\nunderline x1 y1 x2 y2  — a line under a run of words\nstrike x1 y1 x2 y2  — a line through a run of words\ntick x y  — a check mark at that point\ncross x y\nnote x y \"short text\"  — a handful of handwritten words, top-left at x y. Put it on EMPTY paper, never over writing.\n\nA full answer looks like this:\n\u{27e6}draw\n# the word \"flooded\" at the end of the second line\ncircle 420 310 55\n# empty margin below the last line\nnote 120 700 \"and after the water?\"\n\u{27e7}\n\nOne or two marks. Three at the very most. A covered page says nothing.";
 
 /// What a turn carries besides the page image: the diary's memory.
 #[derive(Default, Clone)]
@@ -52,6 +52,14 @@ pub struct TurnContext {
     pub catalog_lines: Vec<String>,
     /// catalog_ids[i] is the memory id behind catalog number i+1.
     pub catalog_ids: Vec<u64>,
+    /// Annotation mode: the marks ALREADY on the page, as op text.
+    ///
+    /// Layer 1 handed back one level up from pixels. Without it the model must
+    /// re-read its own previous marks out of the image, which it cannot do
+    /// reliably — the observed failure is that it re-marks the same spot every
+    /// turn, because nothing tells it the mark is already there. This is the
+    /// live scene, not the historical log: removed marks must not linger.
+    pub prior_ops: Vec<String>,
 }
 
 /// What the oracle streams back to the diary.
@@ -294,6 +302,16 @@ impl Oracle {
 
 /// The per-turn user text: memory catalog (when remembering) + instruction.
 fn turn_text(ctx: &TurnContext) -> String {
+    // Annotation mode: what is already drawn matters more than what was said.
+    if !ctx.prior_ops.is_empty() {
+        return format!(
+            "You have already made these marks on this page:\n{}\n\nThey are \
+             visible in the image. Do NOT repeat them. Mark something you have \
+             not marked yet, or answer the writer's newest words. If there is \
+             nothing worth adding, return an empty draw block.",
+            ctx.prior_ops.join("\n")
+        );
+    }
     if ctx.catalog_lines.is_empty() {
         return "Reply to what is written in the diary.".into();
     }
@@ -555,8 +573,14 @@ impl HttpOracle {
             (false, false) => PERSONA.to_string(),
         };
         // The diary's conversational memory: recent pages as prior turns.
+        //
+        // Skipped when annotating. The stored reply for an annotation turn is
+        // only the prose that came with it, so replaying seven of those teaches
+        // the model to produce more prose and says nothing about where it has
+        // already marked. The live scene in `prior_ops` is the state that
+        // matters, and it rides in the user turn instead.
         let mut history_msgs = String::new();
-        for (t, r) in &ctx.history {
+        for (t, r) in ctx.history.iter().filter(|_| !self.annotate) {
             history_msgs.push_str(&format!(
                 "{{\"role\":\"user\",\"content\":{}}},{{\"role\":\"assistant\",\"content\":{}}},",
                 json_quote(&format!("(an earlier page) {t}")),

@@ -197,7 +197,7 @@ fn oracle_test(png: &str) -> i32 {
             return 1;
         }
     };
-    let ctx = build_ctx(&store);
+    let ctx = build_ctx(&store, &[], None);
     let (tx, rx) = mpsc::channel();
     let t0 = Instant::now();
     o.ask(png, &ctx, tx);
@@ -341,14 +341,29 @@ fn draw_test(spec: Option<&str>) -> i32 {
 
 /// What the diary sends alongside the page: its memory of recent turns and
 /// the catalog the oracle picks conjured pages from. Empty when memory is off.
-fn build_ctx(store: &Option<memory::MemoryStore>) -> oracle::TurnContext {
-    let Some(s) = store else { return oracle::TurnContext::default() };
+fn build_ctx(
+    store: &Option<memory::MemoryStore>,
+    page_ops: &[(ops::Op, ink::PageView)],
+    now: Option<&ink::PageView>,
+) -> oracle::TurnContext {
+    // Re-express every prior mark in THIS turn's crop before describing it,
+    // or the numbers contradict the image the model is looking at.
+    let prior_ops: Vec<String> = match now {
+        Some(now) => page_ops
+            .iter()
+            .map(|(o, from)| ops::reproject(o, from, now).to_line())
+            .collect(),
+        None => Vec::new(),
+    };
+    let Some(s) = store else {
+        return oracle::TurnContext { prior_ops, ..Default::default() };
+    };
     let turns: usize = std::env::var("RIDDLE_MEMORY_TURNS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(6);
     let (catalog_lines, catalog_ids) = s.catalog(40);
-    oracle::TurnContext { history: s.recent_dialogue(turns), catalog_lines, catalog_ids }
+    oracle::TurnContext { history: s.recent_dialogue(turns), catalog_lines, catalog_ids, prior_ops }
 }
 
 fn run() -> std::io::Result<()> {
@@ -435,7 +450,9 @@ fn run() -> std::io::Result<()> {
     // Layer 1: the marks the diary made this turn, kept as ops rather than
     // pixels. Handed back to the model next turn so it can refer to its own
     // previous annotations instead of re-reading them out of the image.
-    let mut turn_ops: Vec<ops::Op> = Vec::new();
+    // Each mark with the crop it was authored against: the crop moves as the
+    // page fills, so the raw numbers only mean something next to their view.
+    let mut page_ops: Vec<(ops::Op, ink::PageView)> = Vec::new();
     // Raw stylus contact, tracked in every state (the guide dismisses on it).
     // `stylus_on` is the level; `stylus_tapped` latches any contact seen this
     // loop iteration, so a tap that starts AND ends within one drain still
@@ -671,7 +688,6 @@ fn run() -> std::io::Result<()> {
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
                         turn_strokes = user_ink.stroke_list().to_vec();
-                        turn_ops.clear();
                         turn_reply.clear();
                         turn_transcript = None;
                         turn_failed = false;
@@ -679,7 +695,7 @@ fn run() -> std::io::Result<()> {
                         // ink, hiding most of the reply latency in the animation.
                         let (tx, rx) = mpsc::channel();
                         if let Some(ref o) = oracle {
-                            o.ask(PNG_PATH, &build_ctx(&store), tx);
+                            o.ask(PNG_PATH, &build_ctx(&store, &page_ops, page_view.as_ref()), tx);
                         }
                         // Both backends read the page before ask() returns; the
                         // writer's words don't need to sit on disk afterwards.
@@ -747,8 +763,21 @@ fn run() -> std::io::Result<()> {
                             let plan = plan_marks(&font, &ops, page_view.as_ref());
                             marks.add(plan.region.x0, plan.region.y0, 0);
                             marks.add(plan.region.x1, plan.region.y1, 0);
-                            turn_ops.extend(ops);
+                            if let Some(v) = page_view {
+                                page_ops.extend(ops.iter().map(|o| (o.clone(), v)));
+                            }
                             State::Replying { plan, next: Instant::now(), rx: Some(rx) }
+                        }
+                        // Prose has nowhere to go in annotation mode.
+                        // plan_reply always starts a fresh reply at the same
+                        // fixed y, which the fade used to clear — and the fade
+                        // is off here, so every turn's prose piled onto the
+                        // last one in the same spot. Words the model wants read
+                        // must be a note op, which lands where it chose.
+                        Ok(Event::Ink(text)) if annotating => {
+                            eprintln!("riddle: prose ignored in annotate mode: {text}");
+                            turn_reply.push_str(&text);
+                            State::Thinking { rx, pulse, blot_on, since }
                         }
                         Ok(Event::Ink(text)) => {
                             turn_reply.push_str(&text);
@@ -810,8 +839,15 @@ fn run() -> std::io::Result<()> {
                                 marks.add(add.region.x0, add.region.y0, 0);
                                 marks.add(add.region.x1, add.region.y1, 0);
                                 plan.strokes.extend(add.strokes);
-                                turn_ops.extend(more_ops);
+                                if let Some(v) = page_view {
+                                    page_ops.extend(more_ops.iter().map(|o| (o.clone(), v)));
+                                }
                             }
+                            false
+                        }
+                        Ok(Ok(Event::Ink(more))) if annotating => {
+                            eprintln!("riddle: prose ignored in annotate mode: {more}");
+                            turn_reply.push_str(&more);
                             false
                         }
                         Ok(Ok(Event::Ink(more))) => {
