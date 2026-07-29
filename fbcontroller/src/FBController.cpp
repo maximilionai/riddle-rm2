@@ -72,11 +72,12 @@ void FBController::setActive(bool active)
 void FBController::paint(QPainter *painter)
 {
     isMidPaint = true;
-    if (this->image && this->_active) {
+    QImage *img = this->image.load(std::memory_order_acquire);
+    if (img && this->_active) {
         if (_allowScaling) {
-            painter->drawImage(QRectF(0, 0, width(), height()), *image, image->rect());
+            painter->drawImage(QRectF(0, 0, width(), height()), *img, img->rect());
         } else {
-            painter->drawImage(0, 0, *image);
+            painter->drawImage(0, 0, *img);
         }
     }
     isMidPaint = false;
@@ -84,17 +85,20 @@ void FBController::paint(QPainter *painter)
 
 void FBController::associateSHM(QImage *img)
 {
-    this->image = img;
     const int key = _framebufferID;
-    // Bounce onto the GUI thread: this is called from a server worker thread.
-    QMetaObject::invokeMethod(this, [this, key]() {
-        if (!qtfb::management::isControllerAssociated(key)) {
-            // The connection went away while we waited for the event loop.
-            this->image = nullptr;
-            this->setActive(false);
-            return;
-        }
-        this->setActive(this->image != nullptr);
+    // Called from a qtfb server worker thread. The assignment itself has to
+    // happen on the GUI thread too, not just setActive(): paint() reads this
+    // pointer, and a client disconnecting mid-paint would otherwise null it
+    // between the check and the dereference -- a segfault inside xochitl,
+    // which is exactly the crash the overlay design exists to avoid.
+    //
+    // Queued calls to one receiver keep their posting order, so the teardown
+    // guarantee in fbmanagement.cpp still holds: this runs before the queued
+    // `delete backendToKill` that munmap()s the buffer behind the QImage.
+    QMetaObject::invokeMethod(this, [this, key, img]() {
+        QImage *next = qtfb::management::isControllerAssociated(key) ? img : nullptr;
+        this->image.store(next, std::memory_order_release);
+        this->setActive(next != nullptr);
     }, Qt::QueuedConnection);
 }
 
@@ -112,12 +116,13 @@ void FBController::markedUpdate(const QRect &rect)
         update(contentsBoundingRect().toAlignedRect());
         return;
     }
-    if (_allowScaling && image && image->width() > 0 && image->height() > 0) {
+    QImage *img = this->image.load(std::memory_order_acquire);
+    if (_allowScaling && img && img->width() > 0 && img->height() > 0) {
         // Upstream does `(rect.x() / image->width()) * width()` in integer
         // arithmetic, which truncates to 0 for every realistic rect. Multiply
         // first.
-        const qreal sx = width() / (qreal) image->width();
-        const qreal sy = height() / (qreal) image->height();
+        const qreal sx = width() / (qreal) img->width();
+        const qreal sy = height() / (qreal) img->height();
         update(QRect((int) (rect.x() * sx),
                      (int) (rect.y() * sy),
                      (int) (rect.width() * sx) + 1,
@@ -145,9 +150,10 @@ bool FBController::autoHide() const { return _autoHide; }
 
 QPoint FBController::convertPointToQTFBPixels(const QPointF &input) const
 {
-    if (_allowScaling && image && width() > 0 && height() > 0) {
-        return QPoint((int) (input.x() * image->width() / width()),
-                      (int) (input.y() * image->height() / height()));
+    QImage *img = this->image.load(std::memory_order_acquire);
+    if (_allowScaling && img && width() > 0 && height() > 0) {
+        return QPoint((int) (input.x() * img->width() / width()),
+                      (int) (input.y() * img->height() / height()));
     }
     return QPoint((int) input.x(), (int) input.y());
 }

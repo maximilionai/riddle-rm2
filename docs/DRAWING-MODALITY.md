@@ -200,11 +200,24 @@ both layers goes back. This is where the idea is actually proved.
 
 ## Decisions to make before writing code
 
-1. **Is this Tom?** The diary persona is instructed to never mention images and
-   to only perceive words. An annotating assistant is a different character and
-   arguably a different app. Cleanest is a second mode behind
-   `RIDDLE_MODE=annotate` with its own persona, sharing everything below the
-   prompt.
+1. ~~**Is this Tom?**~~ **Settled — and then reversed.** The original answer was
+   a second persona behind `RIDDLE_MODE=annotate`, because the diary persona was
+   instructed to never mention images and to only perceive words, which is
+   exactly wrong for something that must point at the page.
+
+   That reasoning was sound but the premise was not: the page is sent as an
+   image on *every* turn, in both modes. The persona was blindfolding a model
+   that could already see. Removing that clause removed the need for a second
+   character, and Tom is gone entirely — there is now one `COLLABORATOR`, and
+   what differs between modes is only the channel protocol appended to it
+   (`DRINK_PROTOCOL` or `KEEP_PROTOCOL` + `DRAW_PROTOCOL`).
+
+   The surviving difference is real but smaller than it looked: it is about the
+   **page**, not the personality. Drink clears the page, so a reply can be prose
+   written into the freed space and marks would point at vanishing ink. Keep
+   holds the page, so marks land on something and prose has nowhere to go. That
+   is a per-turn property, carried in `TurnContext.mode` and chosen by the
+   writer with a button — not a launch flag.
 2. **Structured outputs vs streaming.** Cerebras supports strict JSON schemas —
    which would guarantee well-formed ops — but its `json_object` mode is *not*
    compatible with streaming. For short geometry output, giving up streaming may

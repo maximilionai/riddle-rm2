@@ -93,5 +93,10 @@ private:
     bool checkingGestureDragDown = false;
     bool refreshedScreenAlready = false;
 
-    QImage *image = nullptr;
+    // Written only on the GUI thread (associateSHM() queues the assignment),
+    // but read from wherever a Qt callback lands. Atomic so that a load into a
+    // local is well-defined: every reader below takes one copy and then works
+    // from it, because a bare `if (image) ... *image` is a torn check-then-use
+    // that a disassociating client can null out in between.
+    std::atomic<QImage *> image { nullptr };
 };

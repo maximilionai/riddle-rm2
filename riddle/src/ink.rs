@@ -49,6 +49,42 @@ impl Ink {
         dirty
     }
 
+    /// Put a captured stroke set back on the page, ink and model together.
+    ///
+    /// The diary drinks the writing before it knows whether the oracle will
+    /// answer, so a dropped connection would otherwise cost the writer the
+    /// page they had just filled. The strokes are already captured at commit
+    /// time for the memory store; this repaints them exactly as the pen laid
+    /// them down and makes them live again, so the page can be edited, erased
+    /// and re-committed as if the failed turn had never happened.
+    ///
+    /// Returns the dirty rect to hand to the display.
+    pub fn restore(&mut self, surf: &mut Surface, strokes: &[Vec<(i32, i32, i32)>]) -> BBox {
+        let mut dirty = BBox::empty();
+        for stroke in strokes {
+            let mut prev: Option<(i32, i32, i32)> = None;
+            for &(x, y, r) in stroke {
+                // Mirror pen_point(): first point of a stroke is a stamp,
+                // every later point is a line from its predecessor.
+                if let Some((px, py, pr)) = prev {
+                    surf.brush_line(px, py, x, y, r.min(pr + 1), BLACK);
+                    dirty.add(px, py, pr + 2);
+                } else {
+                    surf.stamp(x, y, r, BLACK);
+                }
+                dirty.add(x, y, r + 2);
+                self.bbox.add(x, y, r + 2);
+                prev = Some((x, y, r));
+            }
+            if !stroke.is_empty() {
+                self.strokes.push(stroke.clone());
+            }
+        }
+        self.current.clear();
+        self.last_erase = None;
+        dirty
+    }
+
     /// Eraser tip: brush white over the page AND drop the stored points it
     /// covers, so the stroke model stays true to the visible page. Without
     /// this, erased ink would still be remembered and re-conjured, and an
@@ -249,17 +285,54 @@ fn px_hash(x: i32, y: i32) -> u32 {
     h ^ (h >> 16)
 }
 
-/// One pass of the "diary drinks the ink" effect: erase the pixels whose hash
-/// falls in this stage. After `stages` passes the region is clean white.
-pub fn dissolve_pass(surf: &mut Surface, region: BBox, stage: u32, stages: u32) {
-    if region.is_empty() {
-        return;
+/// The "diary drinks the ink" effect, planned once and then spent one stage at
+/// a time.
+///
+/// The obvious implementation re-walks the whole bounding rectangle on every
+/// stage, asking `luma` about each pixel — but the page is mostly white, so a
+/// full-page drink spent ~37 million bounds-checked, format-dispatching pixel
+/// reads on a single-core Cortex-A7 to erase the few percent that hold ink.
+/// Worse, each pass had to fit in a 70ms frame budget, and a big one did not,
+/// which stretched the animation and delayed pen sampling behind it.
+///
+/// So: scan once, keep only the dark pixels, and bucket them by the same hash
+/// the old code used. Stage N then erases exactly bucket N — pixel for pixel
+/// the same result, because a pixel whose hash bucket is N was first whitened
+/// at stage N and merely re-whitened afterwards.
+pub struct Dissolve {
+    /// buckets[n] holds the pixels that disappear at stage n.
+    buckets: Vec<Vec<(u16, u16)>>,
+}
+
+impl Dissolve {
+    /// A dissolve with nothing to erase.
+    pub fn empty() -> Self {
+        Self { buckets: Vec::new() }
     }
-    for y in region.y0..=region.y1 {
-        for x in region.x0..=region.x1 {
-            if surf.luma(x, y) < 250 && px_hash(x, y) % stages <= stage {
-                surf.put_px(x, y, WHITE);
+
+    pub fn plan(surf: &Surface, region: BBox, stages: u32) -> Self {
+        let mut buckets = vec![Vec::new(); stages.max(1) as usize];
+        if region.is_empty() {
+            return Self { buckets };
+        }
+        for y in region.y0..=region.y1 {
+            for x in region.x0..=region.x1 {
+                if surf.luma(x, y) < 250 {
+                    let b = (px_hash(x, y) % stages.max(1)) as usize;
+                    buckets[b].push((x as u16, y as u16));
+                }
             }
+        }
+        Self { buckets }
+    }
+
+    /// Erase this stage's share of the ink. Out-of-range stages are a no-op.
+    pub fn pass(&mut self, surf: &mut Surface, stage: u32) {
+        let Some(bucket) = self.buckets.get_mut(stage as usize) else {
+            return;
+        };
+        for (x, y) in bucket.drain(..) {
+            surf.put_px(x as i32, y as i32, WHITE);
         }
     }
 }
@@ -299,6 +372,111 @@ mod tests {
                 assert!((x - 110).pow(2) + (y - 100).pow(2) > 22 * 22);
             }
         }
+    }
+
+    /// A failed turn has to give the writer their page back: the same pixels
+    /// dark again, and the same strokes live in the model so the page can be
+    /// erased and re-committed.
+    #[test]
+    fn restore_puts_back_both_the_pixels_and_the_strokes() {
+        let (_buf, mut s) = surf();
+        let mut ink = Ink::new();
+        for x in (20..=200).step_by(10) {
+            ink.pen_point(&mut s, x, 100, 3);
+        }
+        ink.pen_up();
+        let kept: Vec<Vec<(i32, i32, i32)>> = ink.stroke_list().to_vec();
+        let inked_before = dark_count(&s);
+        let bbox_before = ink.bbox;
+
+        // The drink: pixels wiped, model emptied — exactly what Drinking does.
+        let mut fade = Dissolve::plan(&s, bbox_before, 14);
+        for stage in 0..14 {
+            fade.pass(&mut s, stage);
+        }
+        ink.clear();
+        assert_eq!(dark_count(&s), 0, "the drink should leave clean paper");
+        assert!(ink.is_empty());
+
+        let dirty = ink.restore(&mut s, &kept);
+
+        assert_eq!(ink.stroke_list(), &kept[..], "strokes must come back intact");
+        assert_eq!(
+            dark_count(&s),
+            inked_before,
+            "restored page should be as dark as the original"
+        );
+        assert!(!dirty.is_empty(), "restore must report what to repaint");
+        assert!(!ink.is_empty(), "restored ink must be live again");
+    }
+
+    /// Restoring must not double-count: the strokes go back once, not once per
+    /// call plus whatever was already there.
+    #[test]
+    fn restore_of_nothing_changes_nothing() {
+        let (_buf, mut s) = surf();
+        let mut ink = Ink::new();
+        ink.pen_point(&mut s, 50, 50, 3);
+        ink.pen_up();
+        let before = ink.stroke_list().to_vec();
+        let dirty = ink.restore(&mut s, &[]);
+        assert!(dirty.is_empty());
+        assert_eq!(ink.stroke_list(), &before[..]);
+    }
+
+    /// The bucketed dissolve has to match the old full-rescan one exactly:
+    /// same pixels gone at the same stage, and clean paper at the end.
+    #[test]
+    fn dissolve_erases_the_same_pixels_the_rescan_did() {
+        let (_buf, mut s) = surf();
+        let mut ink = Ink::new();
+        for x in (20..=200).step_by(7) {
+            ink.pen_point(&mut s, x, 100, 3);
+        }
+        ink.pen_up();
+        let region = ink.bbox;
+
+        // What the old implementation would have erased at each stage: every
+        // dark pixel whose hash bucket is <= stage.
+        const STAGES: u32 = 14;
+        let mut expected_gone_by = vec![Vec::new(); STAGES as usize];
+        for y in region.y0..=region.y1 {
+            for x in region.x0..=region.x1 {
+                if s.luma(x, y) < 250 {
+                    expected_gone_by[(px_hash(x, y) % STAGES) as usize].push((x, y));
+                }
+            }
+        }
+
+        let mut fade = Dissolve::plan(&s, region, STAGES);
+        for stage in 0..STAGES {
+            fade.pass(&mut s, stage);
+            // Everything scheduled up to and including this stage is white.
+            for b in 0..=stage as usize {
+                for &(x, y) in &expected_gone_by[b] {
+                    assert!(s.luma(x, y) >= 250, "stage {stage}: ({x},{y}) should be gone");
+                }
+            }
+            // Nothing scheduled later has been touched yet.
+            for b in (stage as usize + 1)..STAGES as usize {
+                for &(x, y) in &expected_gone_by[b] {
+                    assert!(s.luma(x, y) < 250, "stage {stage}: ({x},{y}) went early");
+                }
+            }
+        }
+        assert_eq!(dark_count(&s), 0, "the drink must finish on clean paper");
+    }
+
+    fn dark_count(s: &Surface) -> usize {
+        let mut n = 0;
+        for y in 0..400 {
+            for x in 0..400 {
+                if s.luma(x, y) < 250 {
+                    n += 1;
+                }
+            }
+        }
+        n
     }
 
     #[test]

@@ -98,14 +98,15 @@ pub fn looks_like_question_mark(strokes: &[Vec<(i32, i32, i32)>]) -> bool {
 const TITLE: &str = "The Diary";
 /// Takeover mode: riddle owns touch and the power button.
 const BODY_TAKEOVER: &[&str] = &[
-    "Write, then rest your quill:",
-    "the diary drinks your ink and Tom replies.",
+    "Write, then rest your pen:",
+    "the page is read, and answered.",
     "",
     "The diary remembers. Ask it:",
     "\"show me what I wrote about...\"",
     "and the page will rise again.",
     "",
     "Flip the marker to erase.",
+    "Top right: drink or keep the page.",
     "Tap five fingers at once to leave.",
     "The power button sleeps the diary.",
     "",
@@ -113,14 +114,15 @@ const BODY_TAKEOVER: &[&str] = &[
 ];
 /// Windowed mode: AppLoad owns the window and xochitl owns the button.
 const BODY_WINDOWED: &[&str] = &[
-    "Write, then rest your quill:",
-    "the diary drinks your ink and Tom replies.",
+    "Write, then rest your pen:",
+    "the page is read, and answered.",
     "",
     "The diary remembers. Ask it:",
     "\"show me what I wrote about...\"",
     "and the page will rise again.",
     "",
     "Flip the marker to erase.",
+    "Top right: drink or keep the page.",
     "Close the diary from AppLoad.",
     "",
     "A large ? summons this guide.",

@@ -131,7 +131,12 @@ static bool tryAttach()
         if (envFlag("RIDDLE_FB_PROBE", false))
             qtfb::screenmode::dumpProbe(c);
         {
-            const int sm = envInt("RIDDLE_FB_SCREENMODE", qtfb::screenmode::ModeMono);
+            // Default to Pen, the mode that was actually measured fastest for
+            // handwriting. It used to default to Mono and rely on the deploy
+            // script writing RIDDLE_FB_SCREENMODE=0 into a systemd drop-in --
+            // but that drop-in lives on the OS partition, so an A/B system
+            // update silently reverts the panel to the slow waveform.
+            const int sm = envInt("RIDDLE_FB_SCREENMODE", qtfb::screenmode::ModePen);
             if (sm >= 0)
                 qtfb::screenmode::attach(c, sm, getenv("RIDDLE_FB_SCREENMODE_URI"));
         }

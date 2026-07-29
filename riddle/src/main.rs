@@ -1,4 +1,4 @@
-//! riddle — the diary of Tom Riddle, for the reMarkable Paper Pro.
+//! riddle — a handwriting notebook you can talk to, for the reMarkable 2.
 //!
 //! Write on the page with the pen. After a pause the diary drinks your ink,
 //! and an answer writes itself onto the page in a flowing hand, then fades.
@@ -69,6 +69,10 @@ const ORACLE_POLL: Duration = Duration::from_millis(10);
 /// How long the diary waits on a silent oracle before giving up on the turn.
 /// Generous: thinking models can lead with a long silence.
 const ORACLE_PATIENCE: Duration = Duration::from_secs(120);
+/// How often to ask the kernel whether the tablet slept. Cheap (one small
+/// sysfs read) and nowhere near the pen's timescale, so 2s costs nothing and
+/// still heals the radio before the writer finishes their first sentence.
+const SUSPEND_POLL: Duration = Duration::from_secs(2);
 // Layout constants below were tuned for the Paper Pro's 1620x2160 page;
 // fb::s / the REF_W ratio rescales them to this panel (13/15).
 const REPLY_PX: f32 = 96.0 * SCREEN_W as f32 / fb::REF_W as f32;
@@ -79,7 +83,7 @@ const ERASER_R: i32 = fb::s(22);
 const BLOT: usize = fb::su(14);
 
 const USAGE: &str = "\
-riddle — the diary of Tom Riddle
+riddle — a handwriting notebook you can talk to
 
 usage:
   riddle                      open the diary (windowed when AppLoad sets
@@ -101,16 +105,16 @@ type OracleRx = mpsc::Receiver<Result<Event, String>>;
 
 enum State {
     Listening { last_pen: Option<Instant> },
-    Drinking { stage: u32, next: Instant, region: BBox, rx: OracleRx },
+    Drinking { fade: ink::Dissolve, stage: u32, next: Instant, region: BBox, rx: OracleRx },
     Thinking { rx: OracleRx, pulse: Instant, blot_on: bool, since: Instant },
     Replying { plan: WritePlan, next: Instant, rx: Option<OracleRx> },
     Lingering { until: Instant, region: BBox },
-    FadingReply { stage: u32, next: Instant, region: BBox },
+    FadingReply { fade: ink::Dissolve, stage: u32, next: Instant, region: BBox },
     /// The guide panel. `panel: None` = dismissed, waiting for pen-up so the
     /// dismissing touch doesn't leave a mark on the page.
     Help { panel: Option<help::Help>, until: Instant },
     /// A remembered page rising through the paper: date, the writer's own
-    /// past ink, Tom's old reply — all in faded ink. `saved` is today's page.
+    /// past ink, the old reply — all in faded ink. `saved` is today's page.
     Conjuring { plan: ConjurePlan, next: Instant, saved: Vec<u8> },
     /// The conjured memory rests on the page. Pen contact (or time) dissolves
     /// it and today's page returns. `saved: None` = dismissed, waiting pen-up.
@@ -248,7 +252,14 @@ fn oracle_test(png: &str) -> i32 {
             return 1;
         }
     };
-    let ctx = build_ctx(&store, &[], None);
+    // `--oracle-test PAGE.png` exercises whichever mode the environment asks
+    // for, so it can be used to check the marking path too.
+    let mode = match std::env::var("RIDDLE_MODE").ok().as_deref() {
+        Some("annotate") | Some("keep") => oracle::PageMode::Keep,
+        _ => oracle::PageMode::Drink,
+    };
+    eprintln!("oracle test: {} mode", mode.label());
+    let ctx = build_ctx(&store, &[], None, mode);
     let (tx, rx) = mpsc::channel();
     let t0 = Instant::now();
     o.ask(png, &ctx, tx);
@@ -341,7 +352,15 @@ fn draw_test(spec: Option<&str>) -> i32 {
         SCREEN_W * 4,
         surface::PixFmt::Rgb32,
     );
-    paint_buttons(&mut surf);
+    // Keep by default — marks are that mode's channel — but honour RIDDLE_MODE
+    // so the drink furniture can be eyeballed too.
+    paint_buttons(
+        &mut surf,
+        match std::env::var("RIDDLE_MODE").ok().as_deref() {
+            Some("drink") => oracle::PageMode::Drink,
+            _ => oracle::PageMode::Keep,
+        },
+    );
     // Exactly what the animator does, with the 14ms pacing taken out.
     let mut points = 0usize;
     for s in &strokes {
@@ -397,6 +416,7 @@ fn build_ctx(
     store: &Option<memory::MemoryStore>,
     page_marks: &[Mark],
     now: Option<&ink::PageView>,
+    mode: oracle::PageMode,
 ) -> oracle::TurnContext {
     // Re-express every prior mark in THIS turn's crop before describing it,
     // or the numbers contradict the image the model is looking at. A mark the
@@ -418,14 +438,29 @@ fn build_ctx(
         None => Vec::new(),
     };
     let Some(s) = store else {
-        return oracle::TurnContext { prior_ops, ..Default::default() };
+        return oracle::TurnContext { mode, prior_ops, ..Default::default() };
     };
     let turns: usize = std::env::var("RIDDLE_MEMORY_TURNS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(6);
-    let (catalog_lines, catalog_ids) = s.catalog(40);
-    oracle::TurnContext { history: s.recent_dialogue(turns), catalog_lines, catalog_ids, prior_ops }
+    // The catalog only ships with the mode that is taught what it is.
+    // build_system() appends MEMORY_PROTOCOL for Drink alone, so in Keep mode
+    // this would be a numbered list the model was never told how to read --
+    // wasted tokens at best, and at worst an invitation to answer with a
+    // show directive, which conjures a remembered page over the top of the
+    // shared canvas the writer is still working on.
+    let (catalog_lines, catalog_ids) = match mode {
+        oracle::PageMode::Drink => s.catalog(40),
+        oracle::PageMode::Keep => (Vec::new(), Vec::new()),
+    };
+    oracle::TurnContext {
+        mode,
+        history: s.recent_dialogue(turns),
+        catalog_lines,
+        catalog_ids,
+        prior_ops,
+    }
 }
 
 fn run() -> std::io::Result<()> {
@@ -524,18 +559,37 @@ fn run() -> std::io::Result<()> {
     let mut user_ink = ink::Ink::new();
     let mut state = State::Listening { last_pen: None };
     let mut pen_down = false;
+    // A control (clear/undo) has already fired for the touch that is still
+    // down. The button branches run before `pen_down` is set, so without this
+    // latch every SYN frame of one ordinary tap re-fires the action — a single
+    // undo tap would pop several marks and recompose the page for each.
+    let mut button_latched = false;
+    // Owns the pixels beneath the thinking indicator between show and hide.
+    let mut blot = Blot::new();
     // The turn being remembered: strokes captured at commit, transcript and
     // reply accumulated as they stream, stored when the turn completes.
     let mut turn_id: u64 = 0;
     let mut turn_strokes: memory::Strokes = Vec::new();
     let mut turn_reply = String::new();
+    let mut turn_marks_at: usize = 0;
     let mut turn_transcript: Option<String> = None;
     let mut turn_failed = false;
-    // Annotation mode: the diary marks the page instead of writing on it.
-    // Everything below the prompt is shared; what changes is that the writer's
-    // ink is NOT drunk (the marks have to point at something) and the marks are
-    // not faded (the writer answers them on the next turn).
-    let annotating = oracle.as_ref().is_some_and(|o| o.annotating());
+    // What happens to the writer's ink when a turn commits. The writer flips
+    // this with a button at any time; it is the only difference between the two
+    // ways of working, and the collaborator on the other end is the same person
+    // either way.
+    //
+    // Keep mode needs a backend that knows the op vocabulary, so a pi-backed
+    // diary stays in Drink whatever the environment asks for.
+    let can_keep = oracle.as_ref().is_some_and(|o| o.can_keep_page());
+    let mut page_mode = match std::env::var("RIDDLE_MODE").ok().as_deref() {
+        Some("annotate") | Some("keep") if can_keep => oracle::PageMode::Keep,
+        Some("annotate") | Some("keep") => {
+            eprintln!("riddle: this backend cannot mark a kept page; starting in drink mode");
+            oracle::PageMode::Drink
+        }
+        _ => oracle::PageMode::Drink,
+    };
     // The crop the model last saw. Every coordinate it returns is in this
     // space; without it a reply cannot be mapped back onto the page.
     let mut page_view: Option<ink::PageView> = None;
@@ -555,13 +609,19 @@ fn run() -> std::io::Result<()> {
     let mut last_flush = Instant::now();
     // Takeover swaps are cheap and synchronous; qtfb needs coalescing.
     //
-    // rM2: 35ms (~28 updates/s) oversubscribes the panel badly. Each qtfb
-    // update goes shm -> Qt scene graph -> xochitl's compositor -> SWTCON, and
-    // that path sustains far fewer than 28/s, so requests queue and ink lags
-    // further behind the further you write. Raising this REDUCES latency.
-    // Tunable at runtime so the sweet spot can be found without a rebuild.
+    // rM2, before the waveform fix: 35ms (~28 updates/s) oversubscribed the
+    // panel badly. Each qtfb update goes shm -> Qt scene graph -> xochitl's
+    // compositor -> SWTCON, and on the default MONO waveform that path
+    // sustained far fewer than 28/s, so requests queued and ink lagged further
+    // behind the further you wrote — raising the interval REDUCED latency, and
+    // 120ms was the least-bad compromise.
+    //
+    // Selecting the Pen waveform (EPScreenMode, mode=Pen) removed that
+    // backlog: the measured sweet spot is 20ms, which is where the README's
+    // own table lands. 120 is now ~6x worse than the panel can do.
+    // Tunable at runtime so the sweet spot can be re-found without a rebuild.
     let flush_every = {
-        let default_ms = if takeover { 8 } else { 120 };
+        let default_ms = if takeover { 8 } else { 20 };
         let ms = std::env::var("RIDDLE_FLUSH_MS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -571,14 +631,34 @@ fn run() -> std::io::Result<()> {
         Duration::from_millis(ms)
     };
 
-    if annotating {
-        draw_clear_button(&mut surf, &disp);
-    }
+    draw_buttons(&mut surf, &disp, page_mode);
     eprintln!("riddle: the diary is open");
+
+    // Resume detection, independent of the power button.
+    //
+    // In qtfb mode the tablet sleeps under xochitl's control, not ours, so the
+    // power-button block below never runs — which used to leave wifi_heal()
+    // unreachable on every shipped build. Coming back from suspend, the radio
+    // is often stranded: wpa_supplicant fails a few attempts while it settles
+    // and marks the network TEMP-DISABLED. The kernel's suspend counter is the
+    // only honest signal that we slept at all.
+    let mut suspends_seen = power::suspend_count();
+    let mut suspend_checked = Instant::now();
 
     loop {
         if sigterm.load(Ordering::Relaxed) {
             break;
+        }
+        if suspend_checked.elapsed() >= SUSPEND_POLL {
+            suspend_checked = Instant::now();
+            let n = power::suspend_count();
+            if n > suspends_seen {
+                suspends_seen = n;
+                // The dead TLS sessions left in the connection pool are
+                // handled separately, by the oracle's transport retry.
+                eprintln!("riddle: woke from suspend; nudging wi-fi");
+                power::wifi_heal();
+            }
         }
         if let Some(ref mut t) = touch_dev {
             if t.drain_check_quit() {
@@ -650,6 +730,8 @@ fn run() -> std::io::Result<()> {
                 stylus_on = writing;
                 stylus_tapped |= writing;
                 if !writing {
+                    // Lifting the tip re-arms the controls.
+                    button_latched = false;
                     if pen_down {
                         pen_down = false;
                         user_ink.pen_up();
@@ -661,24 +743,55 @@ fn run() -> std::io::Result<()> {
                 }
                 match state {
                     State::Listening { ref mut last_pen } => {
-                        // The clear button is checked before any ink is laid
-                        // down, so tapping it never leaves a stroke behind.
-                        if annotating && hit(clear_button(), s.x, s.y) {
-                            clear_page(&mut surf, &disp);
-                            user_ink.clear();
-                            page_marks.clear();
-                            page_view = None;
+                        // The mode toggle exists in both modes — it is the only
+                        // way between them — so it is tested before the two
+                        // that only exist in Keep.
+                        if can_keep && hit(mode_button(), s.x, s.y) {
+                            if !button_latched {
+                                button_latched = true;
+                                page_mode = page_mode.toggled();
+                                eprintln!("riddle: mode -> {}", page_mode.label());
+                                // Leaving Keep abandons the shared canvas: the
+                                // marks belong to a page that is about to start
+                                // being drunk, and a mark whose target is gone
+                                // is worse than no mark. Layer 1 goes with it.
+                                if !page_mode.keeps_page() && !page_marks.is_empty() {
+                                    page_marks.clear();
+                                    page_view = None;
+                                    recompose(&mut surf, &disp, &user_ink, &page_marks, false);
+                                }
+                                erase_buttons(&mut surf, &disp);
+                                draw_buttons(&mut surf, &disp, page_mode);
+                            }
                             *last_pen = None;
-                            eprintln!("riddle: page cleared");
                             continue;
                         }
-                        if annotating && hit(undo_button(), s.x, s.y) {
-                            match page_marks.pop() {
-                                Some(m) => {
-                                    eprintln!("riddle: undid {}", m.op.to_line());
-                                    recompose(&mut surf, &disp, &user_ink, &page_marks, annotating);
+                        // The clear button is checked before any ink is laid
+                        // down, so tapping it never leaves a stroke behind.
+                        if page_mode.keeps_page() && hit(clear_button(), s.x, s.y) {
+                            if !button_latched {
+                                button_latched = true;
+                                clear_page(&mut surf, &disp, page_mode);
+                                user_ink.clear();
+                                page_marks.clear();
+                                page_view = None;
+                                eprintln!("riddle: page cleared");
+                            }
+                            *last_pen = None;
+                            continue;
+                        }
+                        if page_mode.keeps_page() && hit(undo_button(), s.x, s.y) {
+                            if !button_latched {
+                                button_latched = true;
+                                match page_marks.pop() {
+                                    Some(m) => {
+                                        eprintln!("riddle: undid {}", m.op.to_line());
+                                        recompose(
+                                            &mut surf, &disp, &user_ink, &page_marks, page_mode.keeps_page(),
+                                        );
+                                    }
+                                    None => eprintln!("riddle: nothing to undo"),
                                 }
-                                None => eprintln!("riddle: nothing to undo"),
                             }
                             *last_pen = None;
                             continue;
@@ -694,7 +807,7 @@ fn run() -> std::io::Result<()> {
                                 // or the diary keeps telling the model about a
                                 // mark the writer has already removed.
                                 if erase_marks_near(&mut page_marks, s.x, s.y, ERASER_R) {
-                                    recompose(&mut surf, &disp, &user_ink, &page_marks, annotating);
+                                    recompose(&mut surf, &disp, &user_ink, &page_marks, page_mode.keeps_page());
                                 }
                                 user_ink.erase_point(&mut surf, s.x, s.y, ERASER_R)
                             }
@@ -709,10 +822,10 @@ fn run() -> std::io::Result<()> {
                         // Touching the page while marks rest on it means the
                         // writer is answering them, so in annotation mode this
                         // is the start of the next turn, not a dismissal.
-                        state = if annotating {
+                        state = if page_mode.keeps_page() {
                             State::Listening { last_pen: Some(Instant::now()) }
                         } else {
-                            State::FadingReply { stage: 0, next: Instant::now(), region }
+                            State::FadingReply { fade: ink::Dissolve::plan(&surf, region, 10), stage: 0, next: Instant::now(), region }
                         };
                     }
                     _ => {}
@@ -746,10 +859,10 @@ fn run() -> std::io::Result<()> {
                         }
                         *last_pen = Some(Instant::now());
                     } else if let State::Lingering { region, .. } = state {
-                        state = if annotating {
+                        state = if page_mode.keeps_page() {
                             State::Listening { last_pen: Some(Instant::now()) }
                         } else {
-                            State::FadingReply { stage: 0, next: Instant::now(), region }
+                            State::FadingReply { fade: ink::Dissolve::plan(&surf, region, 10), stage: 0, next: Instant::now(), region }
                         };
                     }
                 }
@@ -798,6 +911,13 @@ fn run() -> std::io::Result<()> {
                     } else if oracle.is_none() {
                         // No spirit at all: don't eat ink that nothing will
                         // answer — leave the writing and put the reason below.
+                        //
+                        // Marked failed so the completion block below cannot
+                        // mistake this excuse for an answer: turn_reply and
+                        // turn_id still hold the PREVIOUS turn's values, and
+                        // committing them again overwrites that memory's
+                        // strokes file with nothing.
+                        turn_failed = true;
                         let y = (user_ink.bbox.y1 + fb::s(90)).min(SCREEN_H as i32 - fb::s(400));
                         let plan = plan_reply(&font, &oracle_excuse("no oracle"), Some(y));
                         State::Replying { plan, next: Instant::now(), rx: None }
@@ -807,80 +927,114 @@ fn run() -> std::io::Result<()> {
                         // because it can only mark inside the image it was
                         // sent. The reply path keeps the tight crop (0.0), so
                         // its token cost is unchanged.
-                        let pad = if annotating { 0.15 } else { 0.0 };
+                        let pad = if page_mode.keeps_page() { 0.15 } else { 0.0 };
                         match user_ink.to_png(&surf, PNG_PATH, pad, marks_bbox(&page_marks)) {
-                            Ok(v) => page_view = Some(v),
                             Err(e) => {
+                                // Do NOT ask anyway. The oracle reads the file
+                                // at PNG_PATH, and with RIDDLE_KEEP_PAGE set
+                                // that is the PREVIOUS page still sitting on
+                                // disk — so the model would answer words the
+                                // writer did not just write. Keep the ink and
+                                // put the reason below it.
                                 eprintln!("riddle: rasterize failed: {e}");
                                 page_view = None;
+                                // Same trap as the no-oracle path above: this
+                                // returns before turn_* is re-armed, so without
+                                // this the excuse commits the previous turn.
+                                turn_failed = true;
+                                let y = (user_ink.bbox.y1 + fb::s(90))
+                                    .min(SCREEN_H as i32 - fb::s(400));
+                                let plan = plan_reply(&font, &oracle_excuse("rasterize"), Some(y));
+                                State::Replying { plan, next: Instant::now(), rx: None }
                             }
-                        }
-                        // Remember this page: strokes now (they're cleared
-                        // after the drink), transcript/reply as they stream.
-                        turn_id = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        turn_strokes = user_ink.stroke_list().to_vec();
-                        turn_reply.clear();
-                        turn_transcript = None;
-                        turn_failed = false;
-                        // Ask NOW: the model streams while the diary drinks the
-                        // ink, hiding most of the reply latency in the animation.
-                        note_answered(&mut page_marks, &user_ink);
-                        let (tx, rx) = mpsc::channel();
-                        if let Some(ref o) = oracle {
-                            o.ask(PNG_PATH, &build_ctx(&store, &page_marks, page_view.as_ref()), tx);
-                        }
-                        // Both backends read the page before ask() returns; the
-                        // writer's words don't need to sit on disk afterwards.
-                        if std::env::var_os("RIDDLE_KEEP_PAGE").is_none() {
-                            let _ = std::fs::remove_file(PNG_PATH);
-                        }
-                        let region = user_ink.bbox;
-                        if annotating {
-                            // Don't drink the ink: the marks are about to point
-                            // at it, and the writer answers them on the page
-                            // they are drawn on. The page is a shared canvas
-                            // from here, so it also never gets cleared for us.
-                            State::Thinking {
-                                rx,
-                                pulse: Instant::now(),
-                                blot_on: false,
-                                since: Instant::now(),
+                            Ok(v) => {
+                                page_view = Some(v);
+                                // Remember this page: strokes now (they're cleared
+                                // after the drink), transcript/reply as they stream.
+                                // They are also what the page is rebuilt from if
+                                // the turn fails — see restore_drunk_page().
+                                turn_id = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                turn_strokes = user_ink.stroke_list().to_vec();
+                                // Marks already on a kept page belong to
+                                // earlier turns; anything past this index is
+                                // what THIS turn draws, and is what gets
+                                // remembered as its reply.
+                                turn_marks_at = page_marks.len();
+                                turn_reply.clear();
+                                turn_transcript = None;
+                                turn_failed = false;
+                                // Ask NOW: the model streams while the diary drinks the
+                                // ink, hiding most of the reply latency in the animation.
+                                note_answered(&mut page_marks, &user_ink);
+                                let (tx, rx) = mpsc::channel();
+                                if let Some(ref o) = oracle {
+                                    o.ask(
+                                        PNG_PATH,
+                                        &build_ctx(&store, &page_marks, page_view.as_ref(), page_mode),
+                                        tx,
+                                    );
+                                }
+                                // Both backends read the page before ask() returns; the
+                                // writer's words don't need to sit on disk afterwards.
+                                if std::env::var_os("RIDDLE_KEEP_PAGE").is_none() {
+                                    let _ = std::fs::remove_file(PNG_PATH);
+                                }
+                                let region = user_ink.bbox;
+                                if page_mode.keeps_page() {
+                                    // Don't drink the ink: the marks are about to point
+                                    // at it, and the writer answers them on the page
+                                    // they are drawn on. The page is a shared canvas
+                                    // from here, so it also never gets cleared for us.
+                                    State::Thinking {
+                                        rx,
+                                        pulse: Instant::now(),
+                                        blot_on: false,
+                                        since: Instant::now(),
+                                    }
+                                } else {
+                                    State::Drinking { fade: ink::Dissolve::plan(&surf, region, 14), stage: 0, next: Instant::now(), region, rx }
+                                }
                             }
-                        } else {
-                            State::Drinking { stage: 0, next: Instant::now(), region, rx }
                         }
                     }
                 }
                 _ => State::Listening { last_pen },
             },
 
-            State::Drinking { stage, next, region, rx } => {
+            State::Drinking { mut fade, stage, next, region, rx } => {
                 const STAGES: u32 = 14;
                 if Instant::now() >= next {
-                    ink::dissolve_pass(&mut surf, region, stage, STAGES);
+                    fade.pass(&mut surf, stage);
                     let (x, y, w, h) = region.rect();
                     disp.update(x, y, w, h, true);
                     if stage + 1 >= STAGES {
                         user_ink.clear();
                         State::Thinking { rx, pulse: Instant::now(), blot_on: false, since: Instant::now() }
                     } else {
-                        State::Drinking { stage: stage + 1, next: Instant::now() + Duration::from_millis(70), region, rx }
+                        State::Drinking { fade, stage: stage + 1, next: Instant::now() + Duration::from_millis(70), region, rx }
                     }
                 } else {
-                    State::Drinking { stage, next, region, rx }
+                    State::Drinking { fade, stage, next, region, rx }
                 }
             }
 
             State::Thinking { rx, pulse, blot_on, since } => match rx.try_recv() {
                 Ok(result) => {
-                    surf.fill_rect(SCREEN_W / 2 - BLOT, SCREEN_H / 2 - BLOT, BLOT * 2, BLOT * 2, WHITE);
-                    disp.update(SCREEN_W as i32 / 2 - BLOT as i32, SCREEN_H as i32 / 2 - BLOT as i32, BLOT as i32 * 2, BLOT as i32 * 2, true);
+                    blot.hide(&mut surf, &disp);
                     // First streamed event: start writing now; keep the
                     // receiver so the rest of the reply can append itself.
                     match result {
+                        // Conjuring replaces the whole page, which is only
+                        // ever right where the page was going to be cleared
+                        // anyway. On a kept page the writer and the diary are
+                        // both still working on it.
+                        Ok(Event::Show(id)) if page_mode.keeps_page() => {
+                            eprintln!("riddle: ignoring a conjuring directive on a kept page ({id})");
+                            State::Thinking { rx, pulse, blot_on, since }
+                        }
                         Ok(Event::Show(id)) => {
                             // An incantation: the rest of this turn is the
                             // conjured memory, not a reply. (rx drops here.)
@@ -905,7 +1059,7 @@ fn run() -> std::io::Result<()> {
                         // is off here, so every turn's prose piled onto the
                         // last one in the same spot. Words the model wants read
                         // must be a note op, which lands where it chose.
-                        Ok(Event::Ink(text)) if annotating => {
+                        Ok(Event::Ink(text)) if page_mode.keeps_page() => {
                             eprintln!("riddle: prose ignored in annotate mode: {text}");
                             turn_reply.push_str(&text);
                             State::Thinking { rx, pulse, blot_on, since }
@@ -921,10 +1075,23 @@ fn run() -> std::io::Result<()> {
                             turn_transcript = Some(t);
                             State::Thinking { rx, pulse, blot_on, since }
                         }
+                        // On a kept page, "nothing came back" is usually the
+                        // model correctly deciding the page needs no mark. The
+                        // page is untouched either way, so an error banner
+                        // across it is worse than saying nothing — the writer
+                        // simply carries on. Real faults still get reported.
+                        Err(ref e) if page_mode.keeps_page() && e.contains("empty reply") => {
+                            eprintln!("riddle: nothing to add to this page");
+                            turn_failed = true;
+                            State::Listening { last_pen: None }
+                        }
                         Err(e) => {
                             eprintln!("riddle: oracle failed: {e}");
                             turn_failed = true;
-                            let plan = plan_reply(&font, &oracle_excuse(&e), None);
+                            let y = restore_drunk_page(
+                                &mut surf, &disp, &mut user_ink, &turn_strokes, page_mode.keeps_page(),
+                            );
+                            let plan = plan_reply(&font, &oracle_excuse(&e), y);
                             State::Replying { plan, next: Instant::now(), rx: None }
                         }
                     }
@@ -934,18 +1101,19 @@ fn run() -> std::io::Result<()> {
                         // The oracle never answered (stalled stream, dead pi):
                         // stop pulsing and say so instead of thinking forever.
                         eprintln!("riddle: oracle timed out after {}s", ORACLE_PATIENCE.as_secs());
-                        surf.fill_rect(SCREEN_W / 2 - BLOT, SCREEN_H / 2 - BLOT, BLOT * 2, BLOT * 2, WHITE);
-                        disp.update(SCREEN_W as i32 / 2 - BLOT as i32, SCREEN_H as i32 / 2 - BLOT as i32, BLOT as i32 * 2, BLOT as i32 * 2, true);
-                        let plan = plan_reply(&font, &oracle_excuse("timed out"), None);
+                        blot.hide(&mut surf, &disp);
+                        turn_failed = true;
+                        let y = restore_drunk_page(
+                            &mut surf, &disp, &mut user_ink, &turn_strokes, page_mode.keeps_page(),
+                        );
+                        let plan = plan_reply(&font, &oracle_excuse("timed out"), y);
                         State::Replying { plan, next: Instant::now(), rx: None }
                     } else if pulse.elapsed() >= Duration::from_millis(600) {
-                        let (cx, cy) = (SCREEN_W as i32 / 2, SCREEN_H as i32 / 2);
                         if blot_on {
-                            surf.fill_rect(cx as usize - BLOT, cy as usize - BLOT, BLOT * 2, BLOT * 2, WHITE);
+                            blot.hide(&mut surf, &disp);
                         } else {
-                            surf.stamp(cx, cy, fb::s(9), BLACK);
+                            blot.show(&mut surf, &disp);
                         }
-                        disp.update(cx - BLOT as i32, cy - BLOT as i32, BLOT as i32 * 2, BLOT as i32 * 2, true);
                         State::Thinking { rx, pulse: Instant::now(), blot_on: !blot_on, since }
                     } else {
                         State::Thinking { rx, pulse, blot_on, since }
@@ -956,19 +1124,16 @@ fn run() -> std::io::Result<()> {
                     // mode that is the model correctly deciding the page needs
                     // no mark. Wipe the pulsing blot on the way out, or the
                     // "nothing to add" answer leaves a dot at the page centre.
-                    surf.fill_rect(SCREEN_W / 2 - BLOT, SCREEN_H / 2 - BLOT, BLOT * 2, BLOT * 2, WHITE);
-                    disp.update(
-                        SCREEN_W as i32 / 2 - BLOT as i32,
-                        SCREEN_H as i32 / 2 - BLOT as i32,
-                        BLOT as i32 * 2,
-                        BLOT as i32 * 2,
-                        true,
-                    );
+                    blot.hide(&mut surf, &disp);
                     State::Listening { last_pen: None }
                 }
             },
 
             State::Replying { mut plan, next, mut rx } => {
+                // Set when the stream dies after the reply has already started
+                // being written. Handled below rather than in the match arm,
+                // because recovering means replacing the whole plan.
+                let mut broke_mid_reply: Option<String> = None;
                 // More of the reply may still be streaming in: append each
                 // new chunk below what is already planned, mid-animation.
                 if let Some(ref r) = rx {
@@ -986,7 +1151,7 @@ fn run() -> std::io::Result<()> {
                             }
                             false
                         }
-                        Ok(Ok(Event::Ink(more))) if annotating => {
+                        Ok(Ok(Event::Ink(more))) if page_mode.keeps_page() => {
                             eprintln!("riddle: prose ignored in annotate mode: {more}");
                             turn_reply.push_str(&more);
                             false
@@ -1015,6 +1180,7 @@ fn run() -> std::io::Result<()> {
                         Ok(Err(e)) => {
                             eprintln!("riddle: oracle failed mid-reply: {e}");
                             turn_failed = true;
+                            broke_mid_reply = Some(e);
                             true
                         }
                         Err(mpsc::TryRecvError::Disconnected) => true,
@@ -1024,7 +1190,37 @@ fn run() -> std::io::Result<()> {
                         rx = None;
                     }
                 }
-                if Instant::now() >= next {
+
+                // The stream broke with half an answer on the page. Until the
+                // SSE reader learned to report mid-stream errors these were
+                // silently treated as complete replies; now they surface, and
+                // in Drink mode they land on a page whose ink has already been
+                // absorbed — so without this the commonest real failure on a
+                // Wi-Fi tablet costs the writer their page.
+                //
+                // Recover the way the Thinking path does: take back the half
+                // reply, put the writing back, and put the reason under it.
+                let recovered = match broke_mid_reply {
+                    Some(e) if !page_mode.keeps_page() && !turn_strokes.is_empty() => {
+                        // Take back the half-written reply first: it is about
+                        // to be replaced, and leaving it would collide with the
+                        // writing coming back underneath it.
+                        let (px, py, pw, ph) = plan.region.rect();
+                        if pw > 0 && ph > 0 {
+                            surf.fill_rect(px as usize, py as usize, pw as usize, ph as usize, WHITE);
+                            disp.update(px, py, pw, ph, false);
+                        }
+                        let y = restore_drunk_page(
+                            &mut surf, &disp, &mut user_ink, &turn_strokes, false,
+                        );
+                        turn_strokes = Vec::new();
+                        Some(plan_reply(&font, &oracle_excuse(&e), y))
+                    }
+                    _ => None,
+                };
+                if let Some(plan) = recovered {
+                    State::Replying { plan, next: Instant::now(), rx: None }
+                } else if Instant::now() >= next {
                     let mut dirty = BBox::empty();
                     let mut budget = 26;
                     while budget > 0 && plan.stroke_i < plan.strokes.len() {
@@ -1051,12 +1247,29 @@ fn run() -> std::io::Result<()> {
                     }
                     if plan.stroke_i >= plan.strokes.len() && rx.is_none() {
                         // The turn is complete: the diary remembers it.
-                        if !turn_failed && !turn_reply.is_empty() {
+                        // A well-behaved Keep turn emits no prose at all --
+                        // it is told not to -- so turn_reply stays empty and
+                        // the turn used to be dropped on the floor: no entry,
+                        // no strokes, nothing to carry into the next page. Its
+                        // answer is the marks it made, so record those.
+                        let drawn: String = page_marks
+                            .get(turn_marks_at..)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|m| m.op.to_line())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let remembered_reply = if turn_reply.trim().is_empty() {
+                            drawn.clone()
+                        } else {
+                            turn_reply.trim().to_string()
+                        };
+                        if !turn_failed && !remembered_reply.is_empty() {
                             if let Some(ref mut s) = store {
                                 s.append(
                                     turn_id,
                                     turn_transcript.as_deref().unwrap_or(""),
-                                    turn_reply.trim(),
+                                    &remembered_reply,
                                     &turn_strokes,
                                 );
                                 // Layer 1 keeps the crop each mark was made
@@ -1075,7 +1288,14 @@ fn run() -> std::io::Result<()> {
                                 s.save_marks(turn_id, &lines);
                             }
                         }
+                        // Everything the commit consumed is dropped here, not
+                        // just the strokes. Any path that reaches Replying
+                        // without re-arming these would otherwise commit them a
+                        // second time, under the previous turn's id.
                         turn_strokes = Vec::new();
+                        turn_reply.clear();
+                        turn_transcript = None;
+                        turn_failed = false;
                         let chars: usize = plan.strokes.iter().map(|s| s.len()).sum();
                         let linger = Duration::from_millis(4000 + (chars as u64) * 2);
                         let region = plan.region;
@@ -1090,13 +1310,13 @@ fn run() -> std::io::Result<()> {
 
             State::Lingering { until, region } => {
                 if Instant::now() >= until {
-                    if annotating {
+                    if page_mode.keeps_page() {
                         // The marks stay. Fading them would erase the thing the
                         // writer is meant to answer, and the shared canvas with
                         // it — layer 1 has to survive to the next turn.
                         State::Listening { last_pen: None }
                     } else {
-                        State::FadingReply { stage: 0, next: Instant::now(), region }
+                        State::FadingReply { fade: ink::Dissolve::plan(&surf, region, 10), stage: 0, next: Instant::now(), region }
                     }
                 } else {
                     State::Lingering { until, region }
@@ -1127,7 +1347,7 @@ fn run() -> std::io::Result<()> {
                     disp.full_refresh(surf.w, surf.h);
                     State::MemoryShown { saved: None, until: Instant::now(), region: plan.region }
                 } else if Instant::now() >= next {
-                    // The memory pours back faster than Tom writes: it is
+                    // The memory pours back faster than a reply is written: it is
                     // remembered, not composed.
                     let mut dirty = BBox::empty();
                     let mut budget = 48;
@@ -1185,20 +1405,20 @@ fn run() -> std::io::Result<()> {
                 None => State::Listening { last_pen: None },
             },
 
-            State::FadingReply { stage, next, region } => {
+            State::FadingReply { mut fade, stage, next, region } => {
                 const STAGES: u32 = 10;
                 if Instant::now() >= next {
-                    ink::dissolve_pass(&mut surf, region, stage, STAGES);
+                    fade.pass(&mut surf, stage);
                     let (x, y, w, h) = region.rect();
                     disp.update(x, y, w, h, true);
                     if stage + 1 >= STAGES {
                         disp.full_refresh(surf.w, surf.h);
                         State::Listening { last_pen: None }
                     } else {
-                        State::FadingReply { stage: stage + 1, next: Instant::now() + Duration::from_millis(80), region }
+                        State::FadingReply { fade, stage: stage + 1, next: Instant::now() + Duration::from_millis(80), region }
                     }
                 } else {
-                    State::FadingReply { stage, next, region }
+                    State::FadingReply { fade, stage, next, region }
                 }
             }
         };
@@ -1223,6 +1443,10 @@ fn run() -> std::io::Result<()> {
             wake = wake.min(now + ORACLE_POLL);
         }
         wait_for_input(&mut wait_set, wake.saturating_duration_since(now));
+        if !prune_dead_fds(&mut wait_set) {
+            eprintln!("riddle: every input descriptor is gone; closing");
+            break;
+        }
     }
 
     eprintln!("riddle: the diary closes");
@@ -1260,9 +1484,37 @@ fn state_deadline(state: &State, ink_empty: bool, pen_down: bool) -> Option<Inst
     }
 }
 
+/// Drop any descriptor the kernel has hung up, error'd, or invalidated.
+///
+/// A dead evdev node (driver unbind, USB-ish rebind, `ENODEV` after a deep
+/// sleep) stays readable-in-the-poll-sense forever: `POLLHUP` is reported on
+/// every call and `poll()` returns instantly, so the loop's timeout never
+/// actually elapses and the diary spins on the CPU — the one thing an idle
+/// tablet must never do. Removing the descriptor turns a spin into an honest,
+/// logged degradation.
+///
+/// Returns false when nothing is left to wait on, which is the caller's cue to
+/// stop rather than busy-loop on an empty set.
+fn prune_dead_fds(fds: &mut Vec<libc::pollfd>) -> bool {
+    let before = fds.len();
+    fds.retain(|p| {
+        let dead = p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0;
+        if dead {
+            eprintln!(
+                "riddle: input fd {} hung up (revents {:#x}); no longer waiting on it",
+                p.fd, p.revents
+            );
+        }
+        !dead
+    });
+    if fds.len() == before {
+        return true;
+    }
+    !fds.is_empty()
+}
+
 /// Sleep until one of `fds` has something to read or `timeout` elapses.
 ///
-/// `fds` is built once — the descriptor set never changes over a run — and
 /// `revents` is cleared on the way in so a stale hangup cannot make this return
 /// instantly forever.
 fn wait_for_input(fds: &mut [libc::pollfd], timeout: Duration) {
@@ -1301,30 +1553,117 @@ fn region_all_white(surf: &Surface, region: BBox) -> bool {
     true
 }
 
-/// What Tom writes when the spirit cannot answer: short, in a diary's voice,
+/// What lands on the page when the oracle cannot answer: short, plain,
 /// but specific enough to act on. The raw error still goes to stderr.
+
+/// The "thinking" indicator, as a save-under so it cannot damage the page.
+///
+/// The blot pulses at the centre of the screen while the oracle is being
+/// waited on. It used to be cleared by filling white — harmless once Drink had
+/// absorbed the page, but destructive on a page that is KEPT: it punched a
+/// white square through the writer's own strokes and the diary's marks, while
+/// `user_ink` and `page_marks` went on believing they were still there. The
+/// next crop then showed the model a hole that contradicted the op list it was
+/// handed, and a later recompose could resurrect the missing pixels.
+struct Blot {
+    /// Pixels that were under the blot before it was first drawn.
+    under: Option<Vec<u8>>,
+}
+
+impl Blot {
+    fn new() -> Self {
+        Self { under: None }
+    }
+
+    fn rect() -> (usize, usize, usize, usize) {
+        (SCREEN_W / 2 - BLOT, SCREEN_H / 2 - BLOT, BLOT * 2, BLOT * 2)
+    }
+
+    fn show(&mut self, surf: &mut Surface, disp: &display::Display) {
+        let (x, y, w, h) = Self::rect();
+        if self.under.is_none() {
+            self.under = Some(surf.copy_rect(x, y, w, h));
+        }
+        surf.stamp(SCREEN_W as i32 / 2, SCREEN_H as i32 / 2, fb::s(9), BLACK);
+        disp.update(x as i32, y as i32, w as i32, h as i32, true);
+    }
+
+    /// Put back exactly what was there. Safe to call when nothing was drawn.
+    fn hide(&mut self, surf: &mut Surface, disp: &display::Display) {
+        let (x, y, w, h) = Self::rect();
+        let Some(under) = self.under.take() else { return };
+        surf.paste_rect(x, y, w, h, &under);
+        disp.update(x as i32, y as i32, w as i32, h as i32, true);
+    }
+}
+
+/// Hand the writer's page back after a turn failed, and return the y at which
+/// the excuse should be written so it lands below the restored writing rather
+/// than on top of it.
+///
+/// The diary drinks the ink during `Drinking`, before it can know whether the
+/// oracle will answer at all — so without this, every dropped connection,
+/// timeout or bad key costs the writer the page they had just filled. The
+/// strokes are already kept in `turn_strokes` for the memory store, so giving
+/// them back is only a matter of repainting them.
+///
+/// Does nothing in annotation mode: there the page is never drunk, so the ink
+/// is still on it and still in `user_ink`.
+fn restore_drunk_page(
+    surf: &mut Surface,
+    disp: &display::Display,
+    user_ink: &mut ink::Ink,
+    strokes: &memory::Strokes,
+    keeps_page: bool,
+) -> Option<i32> {
+    if keeps_page || strokes.is_empty() {
+        return None;
+    }
+    let dirty = user_ink.restore(surf, strokes);
+    if !dirty.is_empty() {
+        let (x, y, w, h) = dirty.rect();
+        disp.update(x, y, w, h, true);
+    }
+    eprintln!("riddle: turn failed; the page has been given back");
+    Some((user_ink.bbox.y1 + fb::s(90)).min(SCREEN_H as i32 - fb::s(400)))
+}
+
+/// What goes on the page when a turn cannot be answered.
+///
+/// Plain and specific. These used to be written in the diary's old occult
+/// voice — "the spirit read your words but said nothing" — which told the
+/// writer nothing about what had gone wrong or what to do, and outlived the
+/// persona it belonged to. Each line now names the actual cause.
 fn oracle_excuse(e: &str) -> String {
     if e.contains("no oracle") {
-        "The diary lies dormant: it found no oracle. \
-         Put an API key in oracle.env, then open me again."
+        "No model configured. Put an API key in oracle.env, then reopen."
             .into()
     } else if e.starts_with("http 401") || e.starts_with("http 403") {
-        "The oracle refused the diary's key. Check RIDDLE_OPENAI_KEY in oracle.env.".into()
+        "The API key was refused. Check RIDDLE_OPENAI_KEY in oracle.env.".into()
     } else if e.starts_with("http ") {
         let code = e.split(':').next().unwrap_or("an error");
-        format!("The oracle rejected the diary's plea ({code}). Check the model and endpoint in oracle.env.")
-    } else if e.contains("request failed") || e.contains("timed out") {
-        "The diary cannot reach its oracle. Is the tablet connected to Wi-Fi?".into()
+        format!("The model endpoint returned {code}. Check the model and base URL in oracle.env.")
+    } else if e.contains("request failed") || e.contains("stream broke") {
+        "Could not reach the model. Is the tablet on Wi-Fi?".into()
+    } else if e.contains("timed out") {
+        "The model took too long. Try again.".into()
+    } else if e.contains("out of room") {
+        // The specific, common case: the model thought until its token budget
+        // was gone. Actionable, because the cap is a setting.
+        "The model ran out of room before answering. Raise RIDDLE_OPENAI_MAX_TOKENS in oracle.env, or write less at once."
+            .into()
     } else if e.contains("empty reply") {
-        "The spirit read your words but said nothing. Write again.".into()
+        "The model returned nothing. Try again.".into()
+    } else if e.contains("rasterize") {
+        "Could not capture the page.".into()
     } else {
-        "The ink blurred before it could answer. Write again.".into()
+        "That turn could not be answered. Try again.".into()
     }
 }
 
 /// Summon a remembered page: snapshot today's page, clear the paper, and plan
 /// the memory's rewriting — the date in a small hand, the writer's own strokes
-/// exactly as they were penned, Tom's old reply beneath — all in faded ink.
+/// exactly as they were penned, the old reply beneath — all in faded ink.
 fn conjure(
     font: &FontRef,
     store: &Option<memory::MemoryStore>,
@@ -1370,7 +1709,7 @@ fn conjure(
         all.push(stroke.clone());
     }
 
-    // Tom's old reply, below.
+    // The old reply, below.
     if !entry.reply.is_empty() {
         let y = (ink_bottom + fb::s(130)).min(SCREEN_H as i32 - fb::s(400));
         let reply = plan_reply(font, &entry.reply, Some(y));
@@ -1452,21 +1791,110 @@ fn undo_button() -> BBox {
     b
 }
 
+/// The mode toggle — the one control that exists in both modes, because it is
+/// how you get from either to the other.
+///
+/// It sits at the FOOT of the stack, not the head: the clear button is already
+/// one button-height from the top edge, so anything above it runs off the page.
+fn mode_button() -> BBox {
+    let u = undo_button();
+    let h = u.y1 - u.y0;
+    let mut b = BBox::empty();
+    b.add(u.x0, u.y1 + fb::s(24), 0);
+    b.add(u.x1, u.y1 + fb::s(24) + h, 0);
+    b
+}
+
 fn hit(b: BBox, x: i32, y: i32) -> bool {
     !b.is_empty() && x >= b.x0 && x <= b.x1 && y >= b.y0 && y <= b.y1
 }
 
-fn draw_buttons(surf: &mut Surface, disp: &display::Display) {
-    paint_buttons(surf);
-    let (x, y, w, h) = clear_button().rect();
+/// Paint the furniture for the mode we are in and push it to the panel.
+///
+/// Clear and undo belong to Keep mode only: in Drink mode the page clears
+/// itself every turn and there are no marks to take back, so a button for
+/// either would be a control that does nothing.
+fn draw_buttons(surf: &mut Surface, disp: &display::Display, mode: oracle::PageMode) {
+    paint_buttons(surf, mode);
+    let (mx, my, mw, mh) = mode_button().rect();
+    disp.update(mx, my, mw, mh, false);
+    if mode.keeps_page() {
+        let (x, y, w, h) = clear_button().rect();
+        disp.update(x, y, w, h, false);
+        let (ux, uy, uw, uh) = undo_button().rect();
+        disp.update(ux, uy, uw, uh, false);
+    }
+}
+
+/// Wipe the furniture area, so a mode switch does not leave the previous
+/// mode's buttons ghosted on the page under the new ones.
+fn erase_buttons(surf: &mut Surface, disp: &display::Display) {
+    // The whole stack, top of clear through bottom of mode, whichever of them
+    // happen to be drawn right now.
+    let c = clear_button();
+    let m = mode_button();
+    let mut area = BBox::empty();
+    area.add(c.x0, c.y0, 0);
+    area.add(m.x1, m.y1, 0);
+    let (x, y, w, h) = area.rect();
+    surf.fill_rect(x as usize, y as usize, w as usize, h as usize, WHITE);
     disp.update(x, y, w, h, false);
-    let (ux, uy, uw, uh) = undo_button().rect();
-    disp.update(ux, uy, uw, uh, false);
+}
+
+/// The mode glyph: a sheet of paper, plus what becomes of what you wrote on it.
+///
+/// Both states draw the same sheet so the button reads as one control changing
+/// rather than two different buttons swapping places. Drink puts an arrow
+/// leaving the page downward — the ink being absorbed. Keep puts a ring inside
+/// it — a mark that stays.
+fn paint_mode_button(surf: &mut Surface, mode: oracle::PageMode) {
+    let (x, y, w, h) = mode_button().rect();
+    let pad = fb::s(18);
+    let (px0, py0) = (x + pad, y + pad);
+    let (px1, py1) = (x + w - pad, y + h - pad);
+    for (ax, ay, bx, by) in [
+        (px0, py0, px1, py0),
+        (px1, py0, px1, py1),
+        (px1, py1, px0, py1),
+        (px0, py1, px0, py0),
+    ] {
+        surf.brush_line(ax, ay, bx, by, 2, FADED);
+    }
+    let (cx, cy) = ((px0 + px1) / 2, (py0 + py1) / 2);
+    match mode {
+        oracle::PageMode::Drink => {
+            // A stroke running down and out through the foot of the page.
+            let top = py0 + fb::s(10);
+            let tip = py1 + fb::s(12);
+            surf.brush_line(cx, top, cx, tip, 2, FADED);
+            let barb = fb::s(12);
+            surf.brush_line(cx, tip, cx - barb, tip - barb, 2, FADED);
+            surf.brush_line(cx, tip, cx + barb, tip - barb, 2, FADED);
+        }
+        oracle::PageMode::Keep => {
+            // A ring sitting on the page, the way a mark does.
+            let r = ((px1 - px0).min(py1 - py0) / 2 - fb::s(6)) as f32;
+            let mut prev: Option<(i32, i32)> = None;
+            let mut a = 0.0f32;
+            while a <= std::f32::consts::TAU + 0.1 {
+                let p = (cx + (r * a.cos()) as i32, cy - (r * a.sin()) as i32);
+                if let Some(q) = prev {
+                    surf.brush_line(q.0, q.1, p.0, p.1, 2, FADED);
+                }
+                prev = Some(p);
+                a += 0.25;
+            }
+        }
+    }
 }
 
 /// The glyphs alone, with no display update, so `--draw-test` can render the
 /// furniture into a PNG on the host and it can actually be looked at.
-fn paint_buttons(surf: &mut Surface) {
+fn paint_buttons(surf: &mut Surface, mode: oracle::PageMode) {
+    paint_mode_button(surf, mode);
+    if !mode.keeps_page() {
+        return;
+    }
     let b = clear_button();
     let (x, y, w, h) = b.rect();
     let inset = fb::s(16);
@@ -1510,18 +1938,14 @@ fn paint_buttons(surf: &mut Surface) {
     }
 }
 
-fn draw_clear_button(surf: &mut Surface, disp: &display::Display) {
-    draw_buttons(surf, disp);
-}
-
 /// Wipe the page back to blank paper and forget both layers.
 ///
 /// A full (non-flashing) update, not a partial one: annotation mode leaves
 /// marks on e-ink for many turns, and partial updates leave ghosts behind that
 /// a partial clear would preserve.
-fn clear_page(surf: &mut Surface, disp: &display::Display) {
+fn clear_page(surf: &mut Surface, disp: &display::Display, mode: oracle::PageMode) {
     surf.fill_rect(0, 0, SCREEN_W, SCREEN_H, WHITE);
-    draw_clear_button(surf, disp);
+    draw_buttons(surf, disp, mode);
     disp.update(0, 0, SCREEN_W as i32, SCREEN_H as i32, false);
 }
 
@@ -1548,7 +1972,7 @@ fn recompose(
     disp: &display::Display,
     user: &ink::Ink,
     marks: &[Mark],
-    annotating: bool,
+    keeps_page: bool,
 ) {
     surf.fill_rect(0, 0, SCREEN_W, SCREEN_H, WHITE);
     for stroke in user.stroke_list() {
@@ -1573,8 +1997,8 @@ fn recompose(
             }
         }
     }
-    if annotating {
-        draw_clear_button(surf, disp);
+    if keeps_page {
+        draw_buttons(surf, disp, oracle::PageMode::Keep);
     }
     // Full, non-flashing: a page this old has accumulated ghosts that a
     // partial update would keep.
@@ -1712,6 +2136,54 @@ fn append_reply(font: &FontRef, plan: &mut WritePlan, more: &str) {
 mod tests {
     use super::*;
 
+    /// Every button must be on the page and clear of its neighbours. The mode
+    /// toggle was first placed above `clear_button`, which put it off the top
+    /// edge — visible only by rendering it, so pin it here instead.
+    #[test]
+    fn buttons_fit_on_the_page_and_do_not_overlap() {
+        let all = [
+            ("clear", clear_button()),
+            ("undo", undo_button()),
+            ("mode", mode_button()),
+        ];
+        for (name, b) in all {
+            assert!(!b.is_empty(), "{name} button is empty");
+            assert!(b.x0 >= 0 && b.y0 >= 0, "{name} starts off-page at {},{}", b.x0, b.y0);
+            assert!(
+                b.x1 < SCREEN_W as i32 && b.y1 < SCREEN_H as i32,
+                "{name} runs off-page to {},{}",
+                b.x1,
+                b.y1
+            );
+        }
+        for (i, (an, a)) in all.iter().enumerate() {
+            for (bn, b) in all.iter().skip(i + 1) {
+                let disjoint = a.x1 < b.x0 || b.x1 < a.x0 || a.y1 < b.y0 || b.y1 < a.y0;
+                assert!(disjoint, "{an} overlaps {bn}");
+            }
+        }
+    }
+
+    /// A tap anywhere in the toggle must be recognised, and must not be
+    /// swallowed by the buttons above it.
+    #[test]
+    fn the_mode_toggle_is_hittable_and_distinct() {
+        let m = mode_button();
+        let (cx, cy) = ((m.x0 + m.x1) / 2, (m.y0 + m.y1) / 2);
+        assert!(hit(m, cx, cy));
+        assert!(!hit(clear_button(), cx, cy));
+        assert!(!hit(undo_button(), cx, cy));
+    }
+
+    /// Toggling is its own inverse, and Keep is the only mode that keeps ink.
+    #[test]
+    fn page_mode_round_trips() {
+        let d = oracle::PageMode::Drink;
+        assert!(!d.keeps_page());
+        assert!(d.toggled().keeps_page());
+        assert_eq!(d.toggled().toggled(), d);
+    }
+
     /// The loop sleeps until `state_deadline`, so a deadline the state machine
     /// will not act on is a zero-length sleep — a spin at full tilt rather than
     /// the old 2ms tick. `Listening` only commits with ink on the page and the
@@ -1742,7 +2214,7 @@ mod tests {
         let region = BBox::empty();
         let states = [
             State::Lingering { until: soon, region },
-            State::FadingReply { stage: 0, next: soon, region },
+            State::FadingReply { fade: ink::Dissolve::empty(), stage: 0, next: soon, region },
             State::Help { panel: None, until: soon },
             State::MemoryShown { saved: None, until: soon, region },
         ];

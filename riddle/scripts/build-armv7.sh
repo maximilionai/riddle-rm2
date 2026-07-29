@@ -6,6 +6,12 @@
 # never asks for a symbol version the tablet lacks. (Bookworm's would be 2.36 —
 # too new. Do not "upgrade" the base image.)
 #
+# The rM2's Cortex-A7 has NEON, but the armv7-unknown-linux-gnueabihf target
+# defaults to generic ARMv7 with VFPv3-D16 and no NEON at all — so every
+# per-pixel loop in ink.rs/surface.rs was being compiled for a weaker CPU than
+# the one it runs on. The C++ half of this project has always passed
+# -mfpu=neon -mcpu=cortex-a7; this is the Rust equivalent.
+#
 # Output: target-docker/armv7-unknown-linux-gnueabihf/release/riddle
 set -eu
 
@@ -19,6 +25,7 @@ exec docker run --rm \
   -e CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc \
   -e CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc \
   -e AR_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-ar \
+  -e CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-cpu=cortex-a7" \
   rust:1-bullseye \
   sh -eu -c '
     if ! command -v arm-linux-gnueabihf-gcc >/dev/null 2>&1; then

@@ -25,8 +25,19 @@ echo "=== deploy $(date) ==="
 [ -f "$STAGED" ] || { echo "FATAL: $STAGED not found"; exit 2; }
 
 mkdir -p "$BAK"
+mkdir -p "$(dirname "$DROPIN")"
 [ -f "$EXT/riddlefb.so" ] && cp -a "$EXT/riddlefb.so" "$BAK/riddlefb.so.old"
-cp -a "$DROPIN" "$BAK/xovi.conf.bak"
+
+# On a first-ever deploy there is no drop-in to back up. That used to be an
+# unguarded cp: it failed, left no backup, and rollback then "restored" a file
+# that did not exist -- silently keeping the environment lines it was supposed
+# to undo. Record which case we are in instead.
+rm -f "$BAK/xovi.conf.bak"
+if [ -f "$DROPIN" ]; then
+    cp -a "$DROPIN" "$BAK/xovi.conf.bak" || { echo "FATAL: cannot back up $DROPIN"; exit 2; }
+else
+    echo "no existing $DROPIN - rollback will remove the one we create"
+fi
 
 state() { systemctl show xochitl -p "$1" | cut -d= -f2; }
 
@@ -37,7 +48,13 @@ rollback() {
     else
         rm -f "$EXT/riddlefb.so"
     fi
-    cp -a "$BAK/xovi.conf.bak" "$DROPIN"
+    if [ -f "$BAK/xovi.conf.bak" ]; then
+        cp -a "$BAK/xovi.conf.bak" "$DROPIN"
+    else
+        # There was nothing here before we started; leaving our drop-in behind
+        # would mean "rolled back" still changed xochitl's environment.
+        rm -f "$DROPIN"
+    fi
     systemctl daemon-reload
     systemctl reset-failed xochitl 2>/dev/null
     systemctl restart xochitl
@@ -60,6 +77,7 @@ for kv in \
     "EPFB_SPLIT_UPDATES=1"
 do
     key=${kv%%=*}
+    [ -f "$DROPIN" ] || printf '[Service]\n' > "$DROPIN"
     sed -i "/^Environment=$key=/d" "$DROPIN"
     printf 'Environment=%s\n' "$kv" >> "$DROPIN"
 done

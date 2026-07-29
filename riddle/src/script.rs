@@ -1,4 +1,4 @@
-//! Tom Riddle's hand: rasterize reply text in Dancing Script, thin it to
+//! The replying hand: rasterize reply text in Dancing Script, thin it to
 //! single-pixel pen paths (Zhang-Suen), trace them into ordered strokes, and
 //! yield them for stroke-by-stroke animation.
 

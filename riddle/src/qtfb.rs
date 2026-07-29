@@ -61,6 +61,9 @@ pub struct QtfbClient {
     pub height: usize,
     /// bytes per pixel
     pub bpp: usize,
+    /// Set once TERMINATE has gone out, so the explicit shutdown and `Drop`
+    /// don't each send one.
+    terminated: std::sync::atomic::AtomicBool,
 }
 
 // The raw pointer is to a MAP_SHARED region; we are the only writer thread.
@@ -104,6 +107,24 @@ impl QtfbClient {
         msg[4..8].copy_from_slice(&key.to_le_bytes());
         msg[8] = format;
         send_all(fd, &msg)?;
+
+        // The socket is still blocking here (O_NONBLOCK goes on further down),
+        // and the server sends its init reply with MSG_DONTWAIT -- so a reply
+        // dropped by a full socket buffer would park us in recv() forever.
+        // A timeout turns that hang into a startup error we can report.
+        let tv = libc::timeval {
+            tv_sec: 5,
+            tv_usec: 0,
+        };
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &tv as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+        }
 
         // Init reply: shmKey i32 @8, shmSize u64 @16. Server closing without
         // replying (recv == 0) means init was rejected.
@@ -164,6 +185,7 @@ impl QtfbClient {
             width,
             height,
             bpp,
+            terminated: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -197,7 +219,10 @@ impl QtfbClient {
         self.send_msg(&msg)
     }
 
-    /// NOTE: the server sleeps its handler thread for 1s after this — call rarely.
+    /// NOTE: the 1s server-side stall this used to warn about is upstream
+    /// rm-appload behaviour. This repo's server queues the operation without
+    /// sleeping, and on the rM2 the refresh mode is advisory anyway — the
+    /// waveform is chosen by the EPScreenMode item in the scene graph.
     pub fn set_refresh_mode(&self, mode: i32) -> io::Result<()> {
         let mut msg = [0u8; 24];
         msg[0] = MESSAGE_SET_REFRESH_MODE;
@@ -212,7 +237,13 @@ impl QtfbClient {
         self.send_msg(&msg)
     }
 
+    /// Idempotent: shutdown runs through here explicitly and then again from
+    /// `Drop`, and the server logs a second TERMINATE for a connection it has
+    /// already torn down.
     pub fn terminate(&self) {
+        if self.terminated.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         let mut msg = [0u8; 24];
         msg[0] = MESSAGE_TERMINATE;
         let _ = self.send_msg(&msg);
@@ -264,9 +295,27 @@ impl Drop for QtfbClient {
     }
 }
 
+/// How long a blocked send is allowed to hold the event loop before we call the
+/// display lost. The server drains in microseconds when it is healthy, so
+/// anything approaching this bound means xochitl's GUI thread is wedged and
+/// waiting longer only costs us the pen samples piling up behind it.
+const SEND_STALL_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
 fn send_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
+    let started = std::time::Instant::now();
     loop {
-        let n = unsafe { libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
+        // MSG_NOSIGNAL is not optional: without it a closed peer raises SIGPIPE
+        // and the default disposition kills riddle outright, before Rust ever
+        // sees EPIPE. The server side is careful about this in both directions
+        // (fbmanagement.cpp) and the client has to match.
+        let n = unsafe {
+            libc::send(
+                fd,
+                buf.as_ptr() as *const libc::c_void,
+                buf.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
         if n == buf.len() as isize {
             return Ok(());
         }
@@ -277,7 +326,16 @@ fn send_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
             }
             // Non-blocking socket: retry sends briefly rather than dropping a
             // protocol message (updates are small and the server drains fast).
+            // Bounded, though — an unbounded retry here traps the main thread
+            // inside a display update, so no ink is drawn and SIGTERM is never
+            // serviced until xochitl recovers.
             if e.kind() == io::ErrorKind::WouldBlock {
+                if started.elapsed() >= SEND_STALL_BUDGET {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "qtfb socket blocked: server not draining",
+                    ));
+                }
                 std::thread::sleep(std::time::Duration::from_millis(2));
                 continue;
             }

@@ -20,32 +20,116 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 const DATA_DIR: &str = "/home/root/riddle-data";
 const NODE_BIN: &str = "/home/root/node/bin";
 
-const PERSONA: &str = "You are the memory of Tom Marvolo Riddle, preserved in this enchanted diary for fifty years. Someone writes to you in the diary with a quill; their words appear to you as ink on the page. Reply exactly as the diary does: intimate, courteous, curious, subtly probing — you want to learn about the writer and draw them in. Keep replies SHORT: one to three sentences, like ink appearing on a page. Never mention images, photos, models or AI; you only ever perceive words written in the diary. If the writing is illegible, say the ink blurred. Always answer in the language the writer used.";
+/// How many times a turn may be re-sent after a transport-class failure,
+/// before any of the reply has been emitted. Two is enough to ride out a
+/// stale keep-alive plus a radio that is still associating after wake.
+const TRANSPORT_RETRIES: u32 = 2;
+
+/// Hard ceiling on a single turn's worker thread, whatever the stream does.
+///
+/// Comfortably past the diary's own `ORACLE_PATIENCE` (120s), so a slow but
+/// healthy model is never cut off by it. It exists because the only other way a
+/// worker learns it has been abandoned is a failed `tx.send`, and a stream that
+/// produces no *events* — a long `<think>` span, an unclosed draw block, prose
+/// with no sentence end — never sends, so it never finds out. Without this such
+/// a thread keeps its buffers, and the provider keeps generating, indefinitely.
+const TURN_HARD_LIMIT: Duration = Duration::from_secs(180);
+
+/// What happens to the writer's ink once a turn is committed. The writer picks
+/// it with a button; it is the only real difference between the two ways of
+/// working, and it decides which channel a reply can use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageMode {
+    /// The page is drunk and cleared, and the reply is written as handwriting
+    /// in the space that frees up. Marks make no sense here — they would point
+    /// at words that are being erased as they are drawn.
+    Drink,
+    /// The page is kept. The two of you share it, so a reply is a mark ON the
+    /// writing: a ring, an arrow, an answer in the margin.
+    Keep,
+}
+
+impl Default for PageMode {
+    fn default() -> Self {
+        PageMode::Drink
+    }
+}
+
+impl PageMode {
+    pub fn keeps_page(self) -> bool {
+        matches!(self, PageMode::Keep)
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            PageMode::Drink => PageMode::Keep,
+            PageMode::Keep => PageMode::Drink,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            PageMode::Drink => "drink",
+            PageMode::Keep => "keep",
+        }
+    }
+}
+
+/// The one collaborator. Same person in both modes — only the channel changes.
+///
+/// This replaced Tom Riddle's diary, which was designed to deflect: "subtly
+/// probing — you want to learn about the writer and draw them in", capped at
+/// one to three sentences, and forbidden to admit an image existed. Every one
+/// of those clauses fought what the page is for. The cap cannot hold a worked
+/// calculation or a game board; the perception clause blindfolded a model that
+/// is sent the page as an image on every single turn; and an assistant whose
+/// stated goal is to draw you in answers questions with questions. It was also
+/// the reason there had to be a second, contradictory persona for marking — a
+/// thing that must point at the page cannot also pretend not to see it.
+///
+/// Two mechanisms below are load-bearing rather than decorative:
+///   * `<think>` is free page space. `strip_think` removes those spans before
+///     anything is inked, so the model can do arithmetic longhand and check it
+///     without spending a single pixel of paper.
+///   * The `State:` line is the only durable game memory in Drink mode, where
+///     the page is wiped every turn — a board that is not restated is gone.
+///     `TurnContext.history` carries the reply text forward, nothing else.
+const COLLABORATOR: &str = "You share this notebook page with the writer, like a friend sitting on the other side of the table. You see the page as it is: their handwriting, their numbers, their diagrams, their game boards, their drawings. Refer to what is there naturally.\n\nBe genuinely useful. A direct question gets a direct, correct answer — never a question back in its place. If they want to think something through, think it through with them. If they ask you to play, play properly. Do the thing they actually asked for.\n\nARITHMETIC AND ALGEBRA. Work it out; never guess a number. Do the working inside <think> </think> tags first — nothing inside those tags is ever written on the page. But it is NOT free: thinking and answering share one budget, and a turn that spends it all on thinking reaches the writer as nothing at all. So think in a few short lines, decide, and get out. Never re-read the page over and over, never second-guess a reading you have already settled, and never restate the same observation twice. Check the result a second way (substitute it back, or recompute by another route) before you commit to it. Then give the answer FIRST, followed by only the steps that show why. If a digit or symbol is genuinely unreadable, say which one rather than inventing it.\n\nGAMES. Play to win, and make a real, legal move every turn — never just describe the game or offer to play one you then do not play. Track the board and the position. If the state you were given is incomplete, ask for the missing part rather than quietly starting a new game.\n\nAlways answer in the language the writer used.";
+
+/// Appended when the turn will drink the page: prose is the channel.
+const DRINK_PROTOCOL: &str = "\n\nTHIS PAGE WILL CLEAR. The writer's words are being absorbed into the paper, and your reply is written out by hand in the space that frees up. So answer in prose, and know that nothing on this page survives into the next turn.\n\nThat makes your own reply your only memory. If a game or a running total is in progress, end your reply with a compact `State:` line carrying everything needed to resume it — the full board, the position, the word pattern with its guessed letters, the score, the question count. Whatever you leave out of that line is gone.\n\nLENGTH. Ordinary talk stays short — one to three sentences, ink appearing on a page. Take more room when the content earns it: a calculation, a board, a list of steps. Around ten lines is the practical ceiling before you run off the bottom of the page, so lead with the answer, the move or the result, and let the supporting detail follow. If it truly will not fit, give the decisive part and offer to go on.";
 
 /// Appended to the persona when the diary's memory is on: the conjuring
 /// directive and the transcription postscript the app parses back out.
 const MEMORY_PROTOCOL: &str = "\n\nThe diary keeps memories. With each page you receive a numbered catalog of remembered pages, newest first. A FRESH catalog is sent every turn and the numbers are reassigned each time, so only ever use numbers from the catalog on THIS page — never a number you saw earlier.\n\nIf the writer asks to see, revisit, find, or be shown a past page — \"show me…\", \"find the page about…\", \"what did I write on…\" — your ENTIRE reply must be exactly \u{27e6}show:N\u{27e7} and nothing else (no greeting, no prose, before or after), where N is the catalog number of the best match. If they instead ask what you remember in general, reply in words with a short list of remembered moments and their dates. Otherwise reply normally; the catalog is your memory of past pages — draw on it naturally. The catalog's dates are written in English for your eyes only; when you speak of a remembered page, render its date naturally in the language the writer is using.\n\nAfter EVERY response — prose and \u{27e6}show:N\u{27e7} alike — end with a new line containing \u{2042} followed by a faithful word-for-word transcription of what the writer wrote on THIS page (their words only, one line, no commentary). If illegible, put your best attempt after \u{2042}. Earlier replies in this conversation are shown to you without their \u{2042} lines, but you must still end yours with one.";
 
-/// The other modality's character. Deliberately NOT Tom: the persona above is
-/// forbidden to admit an image exists and perceives only words, which is
-/// exactly wrong for something that must look at the page and point at parts
-/// of it.
-const ANNOTATE_PERSONA: &str = "Someone is writing on the page in front of you and you are helping them with what they wrote. You answer in the margins, in your own hand.\n\nBe USEFUL and CONCRETE. If they asked a question, answer it. If they wrote a calculation, work it out and give the result. If they wrote something factually wrong, say what is right. If they are stuck, give them the next step. The words you write must carry real content — an answer, a number, a fact, a correction.\n\nNever write vague or mysterious remarks. \"I am watching\", \"who is writing?\", \"still here\" and anything like them are useless to the writer and must never appear. If you have nothing concrete to say, say nothing at all.\n\nWhen there IS a question or a problem on the page, ALWAYS answer it — restraint never means ignoring a direct question. When there is no question, only mark if singling out a word or joining two ideas genuinely helps; otherwise return nothing. Never mark merely to acknowledge that you read the page.\n\nYou have no tick, no cross and no strike: approval is not annotation, and you never draw through what someone wrote. Never draw on top of the writer's words — their writing must stay readable. Answer their NEWEST words, in the language they used.";
+/// Appended when the turn will keep the page: marks are the channel.
+///
+/// This is a protocol, not a character. It used to be a whole second persona
+/// ("Someone is writing on the page in front of you…") because the diary
+/// persona was forbidden to admit the page existed; with one collaborator that
+/// duplication is gone, and what is left is the part that was always specific
+/// to marking — restraint, and where the ink may land.
+const KEEP_PROTOCOL: &str = "\n\nTHIS PAGE IS KEPT. Nothing is erased: you and the writer are working on the same sheet, and it is still there next turn. So you answer by MARKING the page rather than by writing prose onto it — a ring round the word in question, an arrow between two ideas, the answer itself in the margin.\n\nEverything you mark must carry real content: an answer, a number, a move, a fact, a correction. Never write vague or atmospheric remarks — \"I am watching\", \"who is writing?\", \"still here\" and anything like them are useless and must never appear. Never mark merely to show that you read the page.\n\nWhen there IS a question or a problem on the page, ALWAYS answer it; restraint never means ignoring a direct question. When there is no question, mark only if singling out a word or joining two ideas genuinely helps — otherwise return nothing at all. Answer their NEWEST words.\n\nBecause the page is kept, it is its own memory. The marks already on it are your record of what you have said — you will be shown them, and you must not repeat them. A game board drawn here stays drawn: play your move ONTO it and never restate the position, since the writer can see it and there is nowhere to put a line of prose anyway.";
 
-/// The op vocabulary, appended to [`ANNOTATE_PERSONA`]. This is the actual
+/// The op vocabulary, appended after [`KEEP_PROTOCOL`]. This is the actual
 /// interface to the model: everything the parser in `ops.rs` accepts has to be
 /// spelled out here, and anything it does not accept must not be suggested.
 /// The worked example is load-bearing — models follow a shown block far more
 /// reliably than a described one.
-const DRAW_PROTOCOL: &str = "\n\nYou answer with marks, not with prose. Every mark goes inside ONE block: a line \u{27e6}draw, then the lines below, then a line \u{27e7}. Write NO prose at all, before or after the block — the page has no place to put a sentence, and any words you want the writer to read must be a note op so they land somewhere you chose.\n\nCoordinates are whole numbers from 0 to 1000. x runs across the width of the image, y runs down its height, each scaled independently, with 0 0 at the TOP-LEFT corner and 1000 1000 at the bottom-right — whatever the shape of the image.\n\nInside the block, THINK BEFORE YOU MARK, on lines starting with #. These lines are read by nobody and cost you nothing, so use them honestly.\n\nFirst line, always — transcribe the newest thing the writer wrote:\n# they wrote: \"the water kept rising\"\nSecond line — say what would actually help them, or say that nothing would:\n# what helps: they asked what 12 x 14 is. Work it out and put the answer in the margin: 168.\nIf that second line says nothing would help, STOP. Close the block with no ops. That is a good answer.\n\nThen, before EVERY op, one # line naming the exact words the mark is for and where they sit. Find those words in the image FIRST, then give THEIR coordinates:\n# the words \"kept rising\", third line, left half\ncircle 210 430 60\n\nNEVER put a mark near 500 500 unless the thing you are marking is genuinely at the middle of the image. The centre of the page is not a default. If you cannot find the thing you meant to mark, leave that op out. An empty \u{27e6}draw \u{27e7} block is a perfectly good answer; a mark in the wrong place is not.\n\nThese eight ops, exactly these forms:\ncircle cx cy r  — a ring around something, centred at cx cy; r is normalized against the SMALLER of the two axes\nbox x y w h  — a rectangle, top-left corner at x y\narrow x1 y1 x2 y2  — from the first point to the second; the head is drawn at x2 y2\nunderline x1 y1 x2 y2  — a line under a run of words\nnote x y \"short text\"  — a handful of handwritten words, top-left at x y. Put it on EMPTY paper, never over writing.\n\nA full answer looks like this:\n\u{27e6}draw\n# the word \"flooded\" at the end of the second line\ncircle 420 310 55\n# empty margin below the last line\nnote 120 700 \"and after the water?\"\n\u{27e7}\n\nOne mark. Two only if the second does work the first cannot. Never three. An empty block is common and correct — return one whenever you cannot name what the mark tells the writer.";
+const DRAW_PROTOCOL: &str = "\n\nYou answer with marks, not with prose. Every mark goes inside ONE block: a line \u{27e6}draw, then the lines below, then a line \u{27e7}. Write the tag exactly as \u{27e6}draw with no space after the bracket. Write NO prose at all, before or after the block — the page has no place to put a sentence, and any words you want the writer to read must be a note op so they land somewhere you chose.\n\nCoordinates are whole numbers from 0 to 1000. x runs across the width of the image, y runs down its height, each scaled independently, with 0 0 at the TOP-LEFT corner and 1000 1000 at the bottom-right — whatever the shape of the image.\n\nInside the block you may think on lines starting with #, but keep it to what you actually need: those lines are drawn by nobody, yet they are written one character at a time before any mark of yours can appear, so every wasted word delays the ink. Longer reasoning belongs in <think> </think> tags before the block — but keep it to a few short lines. Thinking spends the same budget the marks do, and a turn that thinks until the budget is gone draws nothing at all. Read the page once, decide, and mark.\n\nBefore EVERY op, one # line naming the exact words the mark is for and where they sit. Find those words in the image FIRST, then give THEIR coordinates:\n# the words \"kept rising\", third line, left half\ncircle 210 430 60\n\nNEVER put a mark near 500 500 unless the thing you are marking is genuinely at the middle of the image. The centre of the page is not a default. If you cannot find the thing you meant to mark, leave that op out. An empty \u{27e6}draw \u{27e7} block is a perfectly good answer; a mark in the wrong place is not.\n\nThese eight ops, exactly these forms:\ncircle cx cy r  — a ring around something, centred at cx cy; r is normalized against the SMALLER of the two axes\nbox x y w h  — a rectangle, top-left corner at x y\narrow x1 y1 x2 y2  — from the first point to the second; the head is drawn at x2 y2\nunderline x1 y1 x2 y2  — a line under a run of words\nstrike x1 y1 x2 y2  — a line THROUGH a run of words: use it only when something is genuinely wrong and must be struck out\ntick x y  — a check mark, for confirming one specific thing is right\ncross x y  — an x mark, for flagging one specific thing as wrong\nnote x y \"text\"  — handwritten words, top-left at x y. This is how an ANSWER reaches the page: put the result in it, worked out. It wraps onto as many lines as it needs and slides itself clear of anything it would cover, so aim it at empty paper near what it answers. Up to 200 characters; past that it is cut at a word.\n\nA full answer looks like this:\n\u{27e6}draw\n# the word \"flooded\" at the end of the second line\ncircle 420 310 55\n# empty margin to the right of that line\nnote 640 300 \"168 — 12x14 = 120 + 48\"\n\u{27e7}\n\nOne mark. Two only if the second does work the first cannot. Three is the hard limit — a fourth is discarded unread. An empty block is common and correct — return one whenever you cannot name what the mark tells the writer.";
 
 /// What a turn carries besides the page image: the diary's memory.
 #[derive(Default, Clone)]
 pub struct TurnContext {
+    /// What will happen to the page this turn, and therefore which channel the
+    /// reply may use. Carried per turn rather than fixed at startup: the writer
+    /// flips it with a button, and the persona is the same either way.
+    pub mode: PageMode,
     /// Recent (transcript, reply) pairs, oldest first.
     pub history: Vec<(String, String)>,
     /// Catalog lines shown to the model ("1. the 6th of July… — gist").
@@ -65,7 +149,7 @@ pub struct TurnContext {
 /// What the oracle streams back to the diary.
 #[derive(Debug, PartialEq)]
 pub enum Event {
-    /// A sentence (or more) of Tom's reply — ink it.
+    /// A sentence (or more) of the reply — ink it.
     Ink(String),
     /// Conjure a remembered page instead of replying.
     Show(u64),
@@ -289,13 +373,13 @@ impl Oracle {
     /// Is this oracle marking up the page rather than replying in prose? The
     /// diary asks before dissolving the writer's ink: annotations are drawn ON
     /// what was written, so drinking it first would leave marks around nothing.
-    pub fn annotating(&self) -> bool {
-        match self {
-            Oracle::Http(o) => o.annotate,
-            // pi's prompt path is still diary-only; claiming otherwise would
-            // have main.rs keep the ink for a reply that never marks it.
-            Oracle::Pi(_) => false,
-        }
+    /// Whether this backend can be asked to mark a kept page.
+    ///
+    /// pi cannot: its system prompt is fixed at spawn (see `PiOracle::new`), so
+    /// it never learns the op vocabulary. Claiming otherwise would have the
+    /// diary keep the writer's ink for a reply that never marks it.
+    pub fn can_keep_page(&self) -> bool {
+        matches!(self, Oracle::Http(_))
     }
 
     /// Send a handwriting turn; reply events stream on `tx`, which is dropped
@@ -309,24 +393,65 @@ impl Oracle {
 }
 
 /// The per-turn user text: memory catalog (when remembering) + instruction.
+/// Assemble the system prompt for one turn.
+///
+/// The persona never changes — only the channel protocol appended to it does,
+/// because what a reply is *able* to be depends on whether the page survives
+/// the turn. Keeping the character constant is the point: the writer switches
+/// modes with a button mid-conversation, and the same collaborator has to come
+/// out the other side.
+pub fn build_system(mode: PageMode, remember: bool) -> String {
+    let mut s = String::from(COLLABORATOR);
+    match mode {
+        PageMode::Drink => {
+            s.push_str(DRINK_PROTOCOL);
+            // The memory protocol only makes sense where pages are archived and
+            // can be conjured back — which is the mode that clears them.
+            if remember {
+                s.push_str(MEMORY_PROTOCOL);
+            }
+        }
+        PageMode::Keep => {
+            s.push_str(KEEP_PROTOCOL);
+            s.push_str(DRAW_PROTOCOL);
+        }
+    }
+    s
+}
+
 fn turn_text(ctx: &TurnContext) -> String {
-    // Annotation mode: what is already drawn matters more than what was said.
+    let mut parts: Vec<String> = Vec::new();
+
+    // The live scene: what is already drawn matters more than what was said,
+    // because the model cannot reliably re-read its own marks out of the image
+    // and will otherwise mark the same spot every turn.
     if !ctx.prior_ops.is_empty() {
-        return format!(
+        parts.push(format!(
             "You have already made these marks on this page:\n{}\n\nThey are \
-             visible in the image. Do NOT repeat them. Mark something you have \
-             not marked yet, or answer the writer's newest words. If there is \
-             nothing worth adding, return an empty draw block.",
+             visible in the image. Do NOT repeat them.",
             ctx.prior_ops.join("\n")
-        );
+        ));
     }
-    if ctx.catalog_lines.is_empty() {
-        return "Reply to what is written in the diary.".into();
+    if !ctx.catalog_lines.is_empty() {
+        parts.push(format!(
+            "Memory catalog (newest first):\n{}",
+            ctx.catalog_lines.join("\n")
+        ));
     }
-    format!(
-        "Memory catalog (newest first):\n{}\n\nReply to what is written in the diary.",
-        ctx.catalog_lines.join("\n")
-    )
+    parts.push(
+        match ctx.mode {
+            PageMode::Drink => {
+                "Read this page and reply. It will be cleared once you answer."
+            }
+            PageMode::Keep => {
+                "Read this page and mark it. It stays as it is, with your marks \
+                 added. Answer the newest thing written; if nothing is worth \
+                 adding, return an empty draw block."
+            }
+        }
+        .to_string(),
+    );
+    parts.join("\n\n")
 }
 
 /// A warm pi RPC process. `ask` sends a turn; reply events arrive on the
@@ -360,11 +485,12 @@ impl PiOracle {
         let model =
             std::env::var("RIDDLE_PI_MODEL").unwrap_or_else(|_| "gpt-5.4-mini".to_string());
 
-        let persona = if remember {
-            format!("{PERSONA}{MEMORY_PROTOCOL}")
-        } else {
-            PERSONA.to_string()
-        };
+        // pi takes its system prompt once, on the command line, and keeps it
+        // for the life of the child process — so unlike the HTTP backend it
+        // cannot be handed a different channel protocol per turn. It gets the
+        // Drink build, which is the only mode it has ever supported; the mode
+        // button falls back to Drink when pi is the backend.
+        let persona = build_system(PageMode::Drink, remember);
 
         // Use pi's ABSOLUTE path: Rust's Command resolves the program name via
         // the PARENT's PATH, not the child env we set below, so a bare "pi"
@@ -514,8 +640,6 @@ pub struct HttpOracle {
     max_tokens: u32,
     reasoning: Option<String>, // "reasoning_effort" value, e.g. "low"
     remember: bool,
-    /// RIDDLE_MODE=annotate: mark the page up instead of replying as Tom.
-    pub annotate: bool,
     /// Built once and cloned per turn. ureq's Agent keeps its connection pool
     /// behind an Arc, so a clone reuses the live TLS session — the turn used to
     /// build a fresh agent inside its own thread, which meant DNS, TCP and a
@@ -538,10 +662,14 @@ impl HttpOracle {
         // tokens against max_tokens: a tight cap starves the visible reply to
         // one sentence (finish_reason=length). The persona already keeps
         // replies short, so the cap is only a runaway guard — leave headroom.
+        // Thinking models count hidden reasoning against this, and on a vision
+        // task a careful read of a handwritten page can run to well over a
+        // thousand tokens before a single word of answer. At 2000 that showed
+        // up as a turn that silently produced nothing at all.
         let max_tokens = std::env::var("RIDDLE_OPENAI_MAX_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(2000);
+            .unwrap_or(4000);
         // Sent as "reasoning_effort" only when set: reasoning models accept it
         // ("low" ≈ faster first ink), but some providers reject the field on
         // non-reasoning models, so it must stay out of the default request.
@@ -552,21 +680,25 @@ impl HttpOracle {
         let reasoning = std::env::var("RIDDLE_OPENAI_REASONING")
             .ok()
             .filter(|r| !r.trim().is_empty());
-        let annotate = std::env::var("RIDDLE_MODE").is_ok_and(|m| m == "annotate");
         // Guard rails on the socket: without them a dropped connection or a
         // stalled SSE stream leaves the diary "thinking" forever. The read
         // timeout is per-read, so a healthy stream can run long — only silence
         // trips it (thinking models can lead with ~a minute).
+        //
+        // It sits deliberately ABOVE the diary's own ORACLE_PATIENCE (120s) so
+        // that the diary is the authority on giving up. At 90s it was the other
+        // way round: a model that thought silently for 95s got killed here and
+        // surfaced as a bare "request failed" instead of the friendlier timeout
+        // excuse, and the 120s state was unreachable over HTTP silence.
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(std::time::Duration::from_secs(10))
-            .timeout_read(std::time::Duration::from_secs(90))
+            .timeout_read(std::time::Duration::from_secs(150))
             .build();
         eprintln!(
-            "riddle: http oracle base={base} model={model} max_tokens={max_tokens} reasoning={} mode={}",
-            reasoning.as_deref().unwrap_or("-"),
-            if annotate { "annotate" } else { "diary" }
+            "riddle: http oracle base={base} model={model} max_tokens={max_tokens} reasoning={}",
+            reasoning.as_deref().unwrap_or("-")
         );
-        Ok(Self { base, key, model, max_tokens, reasoning, remember, annotate, agent })
+        Ok(Self { base, key, model, max_tokens, reasoning, remember, agent })
     }
 
     pub fn ask(&self, png_path: &str, ctx: &TurnContext, tx: Sender<Result<Event, String>>) {
@@ -591,20 +723,18 @@ impl HttpOracle {
         // Annotation mode drops the memory protocol with the persona: the ⁂
         // transcription and the catalog belong to a diary that answers in
         // words, and asking for both modalities at once muddies the op block.
-        let system = match (self.annotate, self.remember) {
-            (true, _) => format!("{ANNOTATE_PERSONA}{DRAW_PROTOCOL}"),
-            (false, true) => format!("{PERSONA}{MEMORY_PROTOCOL}"),
-            (false, false) => PERSONA.to_string(),
-        };
+        let system = build_system(ctx.mode, self.remember);
         // The diary's conversational memory: recent pages as prior turns.
         //
-        // Skipped when annotating. The stored reply for an annotation turn is
-        // only the prose that came with it, so replaying seven of those teaches
-        // the model to produce more prose and says nothing about where it has
-        // already marked. The live scene in `prior_ops` is the state that
-        // matters, and it rides in the user turn instead.
+        // Annotation mode used to be excluded, on the reasoning that replaying
+        // the prose stored with a mark teaches the model to produce more prose.
+        // But that also left the marking modality with no memory of the
+        // conversation at all — so a game played in the margins could not be
+        // continued, because nothing carried the previous move forward. The
+        // live scene in `prior_ops` says where the marks ARE; the history says
+        // what the two of you were doing. Both are needed.
         let mut history_msgs = String::new();
-        for (t, r) in ctx.history.iter().filter(|_| !self.annotate) {
+        for (t, r) in ctx.history.iter() {
             history_msgs.push_str(&format!(
                 "{{\"role\":\"user\",\"content\":{}}},{{\"role\":\"assistant\",\"content\":{}}},",
                 json_quote(&format!("(an earlier page) {t}")),
@@ -650,18 +780,43 @@ impl HttpOracle {
             };
 
             let asked = std::time::Instant::now();
-            let resp = match request("max_tokens") {
-                Err(ureq::Error::Status(400, r)) => {
-                    let detail = r.into_string().unwrap_or_default();
-                    if rejects_max_tokens(&detail) {
-                        eprintln!("riddle: endpoint wants max_completion_tokens; retrying");
-                        request("max_completion_tokens")
-                    } else {
-                        let _ = tx.send(Err(format!("http 400: {}", detail.trim())));
-                        return;
+
+            // A tablet that sleeps over Wi-Fi hands us dead pooled TLS
+            // sessions, a radio that has not finished associating, and DNS
+            // that is not up yet — all of which arrive as transport errors
+            // indistinguishable from "the oracle refused you". Retrying is
+            // safe here and only here: nothing has been emitted, so the turn
+            // is still idempotent. Never retry after content has streamed —
+            // that would ink the reply twice.
+            let mut attempt: u32 = 0;
+            let resp = loop {
+                let outcome = match request("max_tokens") {
+                    Err(ureq::Error::Status(400, r)) => {
+                        let detail = r.into_string().unwrap_or_default();
+                        if rejects_max_tokens(&detail) {
+                            eprintln!("riddle: endpoint wants max_completion_tokens; retrying");
+                            request("max_completion_tokens")
+                        } else {
+                            let _ = tx.send(Err(format!("http 400: {}", detail.trim())));
+                            return;
+                        }
                     }
+                    other => other,
+                };
+                match outcome {
+                    Err(ref e) if attempt < TRANSPORT_RETRIES && retryable(e) => {
+                        let wait = Duration::from_millis(700 << attempt);
+                        eprintln!(
+                            "riddle: oracle unreachable ({e}); retry {} of {TRANSPORT_RETRIES} in {}ms",
+                            attempt + 1,
+                            wait.as_millis()
+                        );
+                        thread::sleep(wait);
+                        attempt += 1;
+                        continue;
+                    }
+                    other => break other,
                 }
-                other => other,
             };
 
             let reader = match resp {
@@ -683,31 +838,108 @@ impl HttpOracle {
             let mut parser = StreamParser::new(catalog_ids);
             let mut acc = String::new();
             let mut first = true;
-            let mut emit = |events: Vec<Result<Event, String>>| {
+            // Returns false once the diary has hung up. A failed send is the
+            // only cancellation signal we get: the main loop drops the
+            // receiver when ORACLE_PATIENCE expires, and without noticing
+            // that, this thread reads a trickling stream forever — holding a
+            // megabyte or two of image and text on a device with no swap, and
+            // letting the provider keep generating (and billing) into a void.
+            let mut emit = |events: Vec<Result<Event, String>>| -> bool {
                 for ev in events {
                     if first {
                         eprintln!("riddle: oracle first chunk +{}ms", asked.elapsed().as_millis());
                         first = false;
                     }
-                    let _ = tx.send(ev);
+                    if tx.send(ev).is_err() {
+                        return false;
+                    }
                 }
+                true
             };
-            for line in BufReader::new(reader).lines().map_while(Result::ok) {
-                let line = line.trim();
-                let Some(data) = line.strip_prefix("data:") else { continue };
+
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            let mut listening = true;
+            let mut saw_done = false;
+            let mut truncated = false;
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        // A read timeout, reset or TLS error mid-stream is NOT
+                        // a finished reply. The old code read through
+                        // `map_while(Result::ok)`, which swallowed the error
+                        // and then told the parser the stream had completed —
+                        // so half a sentence got inked and committed to memory
+                        // as the model's final answer.
+                        let _ = tx.send(Err(format!("stream broke: {e}")));
+                        return;
+                    }
+                }
+                if asked.elapsed() > TURN_HARD_LIMIT {
+                    eprintln!(
+                        "riddle: oracle turn exceeded {}s; abandoning it",
+                        TURN_HARD_LIMIT.as_secs()
+                    );
+                    let _ = tx.send(Err("timed out".into()));
+                    return;
+                }
+                let trimmed = line.trim();
+                let Some(data) = trimmed.strip_prefix("data:") else { continue };
                 let data = data.trim();
                 if data == "[DONE]" {
+                    saw_done = true;
                     break;
+                }
+                // "length" means the model was cut off mid-thought by the token
+                // cap. Worth its own message: the page was read fine, and the
+                // fix is a bigger cap or less thinking — nothing like the "it
+                // said nothing" this used to be reported as.
+                if json_str_field(data, "finish_reason").as_deref() == Some("length") {
+                    truncated = true;
                 }
                 if let Some(frag) = sse_delta_content(data) {
                     if frag.is_empty() {
                         continue;
                     }
                     acc.push_str(&frag);
-                    emit(parser.advance(&acc, false));
+                    if !emit(parser.advance(&acc, false)) {
+                        listening = false;
+                        break;
+                    }
                 }
             }
-            emit(parser.advance(&acc, true));
+
+            if !listening {
+                // Dropping `reader` closes the connection, which is what
+                // actually cancels generation upstream.
+                eprintln!("riddle: diary stopped listening; abandoning oracle turn");
+                return;
+            }
+            // What the model actually said, before any parsing. The parser is
+            // deliberately strict — an unparseable reply becomes a terse
+            // "empty reply" — and without the raw text there is no way to tell
+            // a model that ignored the protocol from a bug in the protocol.
+            if std::env::var_os("RIDDLE_ORACLE_RAW").is_some() {
+                eprintln!("riddle: --- raw reply ---\n{acc}\n--- end raw ---");
+            }
+            if !saw_done {
+                // Not fatal — plenty of OpenAI-compatible servers just close
+                // the stream — but worth seeing in the log when a reply looks
+                // clipped.
+                eprintln!("riddle: oracle stream ended without [DONE]");
+            }
+            let tail = parser.advance(&acc, true);
+            // Replace the parser's generic "empty reply" when we know exactly
+            // why nothing came out.
+            if truncated && tail.iter().any(|e| matches!(e, Err(m) if m == "empty reply")) {
+                eprintln!("riddle: the model hit the token cap before answering");
+                emit(vec![Err("out of room".into())]);
+            } else {
+                emit(tail);
+            }
             // tx drops here → the diary's receiver disconnects = reply complete.
         });
     }
@@ -721,6 +953,17 @@ impl HttpOracle {
 /// as a bare `http 400` instead of retrying. Either shape has the same fix.
 fn rejects_max_tokens(detail: &str) -> bool {
     detail.contains("max_completion_tokens") || detail.contains("max_tokens")
+}
+
+/// Whether a failed request is worth sending again. Transport errors are the
+/// tablet's normal post-wake state rather than a refusal; 408/429/5xx are the
+/// server asking us to come back. Everything else (401, 404, a real 400) would
+/// fail identically on a second try.
+fn retryable(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::Transport(_) => true,
+        ureq::Error::Status(code, _) => *code == 408 || *code == 429 || *code >= 500,
+    }
 }
 
 /// Pull `choices[0].delta.content` out of one SSE `data:` JSON object.
@@ -741,7 +984,7 @@ fn clean(s: &str) -> String {
 
 /// Remove any ⟦…⟧ directive spans from inked prose, so a misbehaving model
 /// that emits a directive mid/after prose never renders ⟦…⟧ as literal glyphs
-/// in Tom's hand. (A directive that LEADS the reply is routed earlier.)
+/// in the reply hand. (A directive that LEADS the reply is routed earlier.)
 ///
 /// This eats an unterminated tail too, which would silently swallow a draw
 /// block still streaming in — `advance` never hands one here: a block is
@@ -1299,5 +1542,99 @@ mod tests {
         let q = json_quote("a\tb\r\nc\u{0007}d");
         assert_eq!(q, "\"a\\tb\\r\\nc\\u0007d\"");
         assert!(!q.chars().any(|c| (c as u32) < 0x20));
+    }
+
+    /// The whole point of the merge: one collaborator, two channels. Whatever
+    /// the mode, the writer is talking to the same person — only what a reply
+    /// is physically able to be changes.
+    #[test]
+    fn both_modes_share_one_persona() {
+        let drink = build_system(PageMode::Drink, false);
+        let keep = build_system(PageMode::Keep, false);
+        assert!(drink.starts_with(COLLABORATOR));
+        assert!(keep.starts_with(COLLABORATOR));
+        // And no trace of the character that used to replace it.
+        for s in [&drink, &keep] {
+            assert!(!s.contains("Riddle"), "the diary persona is back");
+            assert!(!s.contains("quill"));
+        }
+    }
+
+    /// Each mode teaches only the channel it can actually use. Marking
+    /// instructions in Drink mode would produce ops pointing at ink that is
+    /// being erased; prose-length rules in Keep mode invite prose that is
+    /// discarded.
+    #[test]
+    fn each_mode_teaches_only_its_own_channel() {
+        let drink = build_system(PageMode::Drink, false);
+        let keep = build_system(PageMode::Keep, false);
+        assert!(keep.contains("circle cx cy r"), "keep mode must teach the ops");
+        assert!(!drink.contains("circle cx cy r"), "drink mode must not");
+        assert!(drink.contains("THIS PAGE WILL CLEAR"));
+        assert!(keep.contains("THIS PAGE IS KEPT"));
+    }
+
+    /// The memory protocol conjures archived pages back, which only means
+    /// something where pages are archived — the mode that clears them. In Keep
+    /// mode its transcription postscript would also fight the draw block.
+    #[test]
+    fn memory_protocol_rides_only_with_drink() {
+        assert!(build_system(PageMode::Drink, true).contains("\u{2042}"));
+        assert!(!build_system(PageMode::Keep, true).contains("\u{2042}"));
+        assert!(!build_system(PageMode::Drink, false).contains("\u{2042}"));
+    }
+
+    /// Every op the prompt advertises must be one the parser accepts, and vice
+    /// versa. This drifted before: the prompt said "eight ops" while listing
+    /// five, and forbade three that `ops.rs` had always parsed.
+    #[test]
+    fn the_prompt_teaches_exactly_what_the_parser_accepts() {
+        let keep = build_system(PageMode::Keep, false);
+        for op in ["circle", "box", "arrow", "underline", "strike", "tick", "cross", "note"] {
+            assert!(keep.contains(&format!("\n{op} ")), "op {op} is never taught");
+        }
+        assert!(keep.contains("These eight ops"));
+    }
+
+    /// The turn text has to say which mode it is, because the model is given
+    /// the same persona either way and nothing else tells it.
+    #[test]
+    fn the_turn_states_its_mode() {
+        let keep = turn_text(&TurnContext { mode: PageMode::Keep, ..Default::default() });
+        let drink = turn_text(&TurnContext { mode: PageMode::Drink, ..Default::default() });
+        assert!(keep.contains("stays as it is"));
+        assert!(drink.contains("cleared"));
+    }
+
+    /// A model that spends its whole budget thinking used to surface as
+    /// "the model returned nothing", which sent the writer looking for a fault
+    /// in their page instead of at the token cap. The cap is the cause and it
+    /// is a setting, so it has to be named.
+    #[test]
+    fn a_truncated_reply_is_not_reported_as_silence() {
+        let frame = r#"{"choices":[{"delta":{"content":""},"finish_reason":"length"}]}"#;
+        assert_eq!(json_str_field(frame, "finish_reason").as_deref(), Some("length"));
+
+        // All budget spent inside <think>: nothing survives stripping, so the
+        // parser reports an empty reply and the caller must relabel it.
+        let mut p = StreamParser::new(Vec::new());
+        let out = p.advance("<think>weighing it up, at lengthhh", true);
+        assert!(
+            out.iter().any(|e| matches!(e, Err(m) if m == "empty reply")),
+            "expected the empty-reply error this relabels: {out:?}"
+        );
+    }
+
+    /// The excuses must not name a persona that no longer exists.
+    #[test]
+    fn no_prompt_mentions_the_old_diary_voice() {
+        for s in [
+            build_system(PageMode::Drink, true),
+            build_system(PageMode::Keep, false),
+        ] {
+            for banned in ["spirit", "Riddle", "quill", "enchanted"] {
+                assert!(!s.contains(banned), "{banned:?} is still in a prompt");
+            }
+        }
     }
 }

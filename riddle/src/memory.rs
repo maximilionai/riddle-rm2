@@ -1,5 +1,5 @@
 //! The diary's memory. Every finished turn is kept — the writer's actual pen
-//! strokes, a transcription of their words, and Tom's reply — so a later
+//! strokes, a transcription of their words, and the reply — so a later
 //! incantation ("show me what I wrote about the garden") can conjure the page
 //! back in the writer's own hand.
 //!
@@ -439,5 +439,31 @@ mod tests {
         let s = spoken_date(1783467000);
         assert!(s.contains("of July"), "{s}");
         assert!(s.contains("6th") || s.contains("7th"), "{s}");
+    }
+
+    /// The shape of the bug an excuse-only turn used to cause: committing a
+    /// second time under a previous turn's id both duplicates its index line
+    /// and — because `append` writes the strokes file unconditionally —
+    /// replaces its strokes with nothing. The state machine now marks such
+    /// turns failed so this cannot be reached, but the destructiveness of a
+    /// repeat append is worth pinning: it is what made that bug data loss
+    /// rather than a cosmetic duplicate.
+    #[test]
+    fn appending_an_id_twice_overwrites_its_strokes() {
+        let mut s = tmp_store("double-append");
+        let real: Strokes = vec![vec![(10, 10, 2), (20, 20, 2), (30, 30, 2)]];
+        s.append(7, "what I wrote", "the reply", &real);
+        assert!(!s.strokes(7).unwrap_or_default().is_empty());
+
+        s.append(7, "what I wrote", "the reply", &Vec::new());
+        assert!(
+            s.strokes(7).unwrap_or_default().is_empty(),
+            "a second append with no strokes silently destroys the first"
+        );
+        assert_eq!(
+            s.entries.iter().filter(|e| e.id == 7).count(),
+            2,
+            "and leaves a duplicate entry behind"
+        );
     }
 }

@@ -22,6 +22,20 @@ trying it on anything else.
 - **Five-finger tap** starts or stops the diary. No computer needed.
 - The stock UI is untouched while the diary is closed; your notebooks are never modified.
 
+It is meant to be a collaborator rather than a curiosity: ask a question and you
+get an answer, set out a calculation and it works it out and checks it, start a
+game and it plays. A button in the top-right corner decides what happens to your
+ink when a turn commits:
+
+| | what happens | how it answers |
+|---|---|---|
+| **drink** | the page is absorbed and cleared | handwriting, in the space that frees up |
+| **keep** | the page stays; you share it | marks on the page — a ring, an arrow, the answer in the margin |
+
+Same collaborator either way. The mode only decides what a reply is physically
+able to be, because a mark cannot point at ink that is being erased and a
+paragraph has nowhere to go on a page that is already full.
+
 ---
 
 ## Architecture

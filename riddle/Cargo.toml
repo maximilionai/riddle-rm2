@@ -22,3 +22,11 @@ takeover = []
 [profile.release]
 strip = true
 lto = true
+# One codegen unit lets LTO see the whole crate: the hot loops here are small
+# functions called per-pixel (Surface::luma, put_px, stamp), and cross-unit
+# inlining is what turns them into real code on a Cortex-A7.
+codegen-units = 1
+# Nothing catches unwinds, and a panic on the tablet should die loudly rather
+# than limp on. Dropping the unwind tables and landing pads also takes a
+# noticeable bite out of the binary.
+panic = "abort"

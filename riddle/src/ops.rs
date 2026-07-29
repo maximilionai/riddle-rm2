@@ -78,7 +78,37 @@ pub fn parse_ops(block: &str) -> (Vec<Op>, usize) {
 
 /// The longest margin note worth writing: past this it stops being an
 /// annotation and starts covering the page it is annotating.
-const NOTE_MAX: usize = 60;
+///
+/// 60 was too tight to be useful. A note is the ONLY way an answer reaches the
+/// page when the writer's ink is being kept, and a genuine one — "168, because
+/// 12x14 = 12x10 + 12x4 = 120 + 48" — is 60 characters before it has finished
+/// explaining itself. `note()` already wraps and already slides itself clear of
+/// the writer's words, so length is bounded by the paper rather than by this.
+const NOTE_MAX: usize = 200;
+
+/// Cut an over-long note back to [`NOTE_MAX`], at a word boundary and loudly.
+///
+/// The old behaviour was `.take(NOTE_MAX)`, which sliced mid-word and said
+/// nothing — so a truncated answer looked like a model that had stopped
+/// mid-thought rather than a limit being hit.
+fn clip_note(s: &str) -> String {
+    if s.chars().count() <= NOTE_MAX {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(NOTE_MAX).collect();
+    let clipped = match cut.rfind(char::is_whitespace) {
+        // Only back up to a word boundary if that keeps most of the text;
+        // one very long word should still be cut rather than vanish.
+        Some(i) if i > NOTE_MAX / 2 => cut[..i].to_string(),
+        _ => cut,
+    };
+    eprintln!(
+        "riddle: note clipped to {} chars (model wrote {})",
+        clipped.chars().count(),
+        s.chars().count()
+    );
+    clipped.trim_end().to_string()
+}
 
 fn parse_op(line: &str) -> Option<Op> {
     let mut it = line.split_whitespace();
@@ -94,7 +124,7 @@ fn parse_op(line: &str) -> Option<Op> {
         if close <= open {
             return None;
         }
-        let text: String = line[open + 1..close].trim().chars().take(NOTE_MAX).collect();
+        let text = clip_note(line[open + 1..close].trim());
         if text.is_empty() {
             return None;
         }
@@ -961,5 +991,39 @@ mod tests {
                 assert!((rx - x).abs() <= 2 && (ry - y).abs() <= 2, "({x},{y}) -> ({u},{w}) -> ({rx},{ry})");
             }
         }
+    }
+
+    /// A note is how an answer reaches a kept page, so the limit has to leave
+    /// room for a real one — and when it does bite, it must bite at a word.
+    #[test]
+    fn a_long_note_survives_and_clips_at_a_word() {
+        let answer = "168, because 12x14 = 12x10 + 12x4 = 120 + 48. Check: 14x12 = 140 + 28 = 168.";
+        assert!(answer.len() > 60, "the old 60-char cap would have cut this");
+        let ops = parse_ops(&format!("note 500 400 \"{answer}\"")).0;
+        assert_eq!(ops, vec![Op::Note { x: 500, y: 400, text: answer.into() }]);
+
+        let long = "word ".repeat(80);
+        let ops = parse_ops(&format!("note 10 10 \"{long}\"")).0;
+        let Op::Note { text, .. } = &ops[0] else { panic!("not a note") };
+        assert!(text.chars().count() <= NOTE_MAX);
+        assert!(!text.ends_with("wor"), "clipped mid-word: {text:?}");
+        assert!(text.ends_with("word"), "should end on a whole word: {text:?}");
+    }
+
+    /// A Keep-mode turn produces no prose, so its marks ARE its reply — the
+    /// text the memory store keeps and replays as the assistant's turn. That
+    /// only works if an op round-trips through `to_line` into something the
+    /// parser accepts again.
+    #[test]
+    fn marks_round_trip_through_their_own_text() {
+        let made = vec![
+            Op::Circle { cx: 420, cy: 310, r: 55 },
+            Op::Note { x: 120, y: 700, text: "y = 0.4x + 9.8".into() },
+            Op::Arrow { x1: 10, y1: 20, x2: 30, y2: 40 },
+        ];
+        let recorded = made.iter().map(|o| o.to_line()).collect::<Vec<_>>().join("\n");
+        let (reparsed, dropped) = parse_ops(&recorded);
+        assert_eq!(dropped, 0, "a recorded mark must parse back: {recorded:?}");
+        assert_eq!(reparsed, made);
     }
 }
